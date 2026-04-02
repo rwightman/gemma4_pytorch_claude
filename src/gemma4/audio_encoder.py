@@ -415,7 +415,7 @@ class AudioEncoder(nn.Module):
         self.audio_norm = RMSNorm(cfg.text_embed_dim, with_scale=False)
 
     def forward(
-        self, mel: torch.Tensor, mel_mask: torch.Tensor
+            self, mel: torch.Tensor, mel_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:

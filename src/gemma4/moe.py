@@ -64,10 +64,10 @@ class MoEExperts(nn.Module):
         nn.init.kaiming_uniform_(self.down)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        weights: torch.Tensor,
-        expert_indices: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            expert_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
@@ -120,11 +120,11 @@ class MoELayer(nn.Module):
     """
 
     def __init__(
-        self,
-        features: int,
-        num_experts: int,
-        top_k: int,
-        expert_dim: int,
+            self,
+            features: int,
+            num_experts: int,
+            top_k: int,
+            expert_dim: int,
     ):
         super().__init__()
         self.router = MoERouter(features, num_experts, top_k)

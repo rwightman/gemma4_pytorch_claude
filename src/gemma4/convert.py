@@ -6,7 +6,7 @@ Usage::
     gemma4-convert --checkpoint /path/to/orbax --variant e2b --output model.safetensors
 
     # As Python API:
-    from gemma4_pytorch_claude.convert import convert_orbax
+    from gemma4.convert import convert_orbax
     convert_orbax("/path/to/orbax", "e2b", "model.safetensors")
 """
 
@@ -110,12 +110,12 @@ def _load_orbax_checkpoint(checkpoint_path: str) -> dict:
 
 
 def _map_text_layer(
-    jax_params: dict,
-    layer_idx: int,
-    attn_type: AttentionType,
-    prefix: str = "text_decoder",
-    has_moe: bool = False,
-    k_eq_v: bool = False,
+        jax_params: dict,
+        layer_idx: int,
+        attn_type: AttentionType,
+        prefix: str = "text_decoder",
+        has_moe: bool = False,
+        k_eq_v: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Map one transformer layer from JAX to our PyTorch naming."""
     jax_prefix = f"layer_{layer_idx}"
@@ -194,9 +194,9 @@ def _map_text_layer(
 
 
 def convert_orbax(
-    checkpoint_path: str,
-    variant: str,
-    output_path: str,
+        checkpoint_path: str,
+        variant: str,
+        output_path: str,
 ) -> None:
     """Convert an Orbax checkpoint to our safetensors format.
 
@@ -206,7 +206,9 @@ def convert_orbax(
         output_path: Output ``.safetensors`` file path.
     """
     if variant not in _VARIANT_FACTORIES:
-        raise ValueError(f"Unknown variant: {variant}. Choose from: {list(_VARIANT_FACTORIES)}")
+        raise ValueError(
+            f"Unknown variant: {variant}. Choose from: {list(_VARIANT_FACTORIES)}"
+        )
 
     factory = _VARIANT_FACTORIES[variant]
     model = factory(text_only=True)
@@ -239,7 +241,9 @@ def convert_orbax(
         state_dict["text_decoder.embedder.pli_proj.weight"] = _convert_linear(jax_params[pli_proj_key])
     pli_proj_norm_key = "embedder/pli_proj_norm/scale"
     if pli_proj_norm_key in jax_params:
-        state_dict["text_decoder.embedder.pli_proj_norm.scale"] = _convert_scale(jax_params[pli_proj_norm_key])
+        state_dict["text_decoder.embedder.pli_proj_norm.scale"] = (
+            _convert_scale(jax_params[pli_proj_norm_key])
+        )
 
     # Per-layer blocks
     for i in range(cfg.num_layers):

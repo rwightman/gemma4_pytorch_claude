@@ -40,7 +40,10 @@ _FFW_HIDDEN_RATIO = 4
 _DEFAULT_GLOBAL_KEY_SIZE = 512
 
 
-def _default_vision(text_embed_dim: int, use_clipped_linear: bool = True) -> VisionConfig:
+def _default_vision(
+        text_embed_dim: int,
+        use_clipped_linear: bool = True,
+) -> VisionConfig:
     return VisionConfig(
         d_model=1152,
         num_layers=27,
@@ -156,7 +159,7 @@ def gemma4_e4b(text_only: bool = False) -> Gemma4Model:
 # ---------------------------------------------------------------------------
 
 def gemma4_31b(text_only: bool = False) -> Gemma4Model:
-    """Gemma4 31B: 60 layers, embed=5376, 32H/16KV(4 global KV), 5:1, sw=1024, k_eq_v_global."""
+    """Gemma4 31B: 60 layers, embed=5376, 32H/16KV(4 global KV), 5:1, sw=1024."""
     num_layers = 60
     embed_dim = 5376
     text = TextConfig(
@@ -193,10 +196,7 @@ def gemma4_31b(text_only: bool = False) -> Gemma4Model:
             use_clipped_linear=False,
             text_embed_dim=embed_dim,
         )
-    cfg = Gemma4Config(
-        text=text,
-        vision=vision,
-    )
+    cfg = Gemma4Config(text=text, vision=vision)
     return Gemma4Model(cfg)
 
 
@@ -205,7 +205,7 @@ def gemma4_31b(text_only: bool = False) -> Gemma4Model:
 # ---------------------------------------------------------------------------
 
 def gemma4_26b_a4b(text_only: bool = False) -> Gemma4Model:
-    """Gemma4 26B-A4B: 30 layers, embed=2816, 16H/8KV(2 global KV), 5:1, sw=1024, MoE(128,top8,704), k_eq_v_global."""
+    """Gemma4 26B-A4B: 30 layers, embed=2816, 16H/8KV(2 global KV), 5:1, MoE."""
     num_layers = 30
     embed_dim = 2816
     text = TextConfig(
@@ -249,8 +249,5 @@ def gemma4_26b_a4b(text_only: bool = False) -> Gemma4Model:
             use_clipped_linear=False,
             text_embed_dim=embed_dim,
         )
-    cfg = Gemma4Config(
-        text=text,
-        vision=vision,
-    )
+    cfg = Gemma4Config(text=text, vision=vision)
     return Gemma4Model(cfg)

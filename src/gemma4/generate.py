@@ -11,10 +11,10 @@ from .model import Gemma4Model
 
 
 def _sample_token(
-    logits: torch.Tensor,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
 ) -> torch.Tensor:
     """Sample a single token from logits ``[B, V]``."""
     if temperature == 0.0:
@@ -38,11 +38,11 @@ def _sample_token(
 
 
 def init_cache(
-    cfg: Gemma4Config,
-    batch_size: int,
-    cache_length: int,
-    dtype: torch.dtype = torch.bfloat16,
-    device: torch.device | str = "cpu",
+        cfg: Gemma4Config,
+        batch_size: int,
+        cache_length: int,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device | str = "cpu",
 ) -> dict:
     """Initialise KV cache for all layers."""
     text = cfg.text
@@ -62,18 +62,18 @@ def init_cache(
 
 @torch.no_grad()
 def generate(
-    model: Gemma4Model,
-    tokens: torch.Tensor,
-    max_new_tokens: int = 64,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    cache_length: int | None = None,
-    # Optional multimodal inputs (only for prefill)
-    image_patches: torch.Tensor | None = None,
-    image_mask: torch.Tensor | None = None,
-    audio_mel: torch.Tensor | None = None,
-    audio_mel_mask: torch.Tensor | None = None,
+        model: Gemma4Model,
+        tokens: torch.Tensor,
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        cache_length: int | None = None,
+        # Optional multimodal inputs (only for prefill)
+        image_patches: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
+        audio_mel: torch.Tensor | None = None,
+        audio_mel_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Autoregressive generation with KV cache.
 
@@ -127,15 +127,15 @@ def generate(
 
 @torch.no_grad()
 def chat(
-    model: Gemma4Model,
-    tokenizer,
-    prompt: str,
-    *,
-    max_new_tokens: int = 256,
-    temperature: float = 0.7,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    device: torch.device | str | None = None,
+        model: Gemma4Model,
+        tokenizer,
+        prompt: str,
+        *,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        device: torch.device | str | None = None,
 ) -> str:
     """Single-turn chat: wrap prompt in Gemma4 chat template, generate, decode.
 

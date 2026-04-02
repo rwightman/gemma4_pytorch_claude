@@ -30,9 +30,9 @@ class LayerCache(TypedDict):
 # ---------------------------------------------------------------------------
 
 def create_sliding_mask(
-    positions: torch.Tensor,
-    cache_positions: torch.Tensor | None,
-    sliding_window_size: int,
+        positions: torch.Tensor,
+        cache_positions: torch.Tensor | None,
+        sliding_window_size: int,
 ) -> torch.Tensor:
     """``[B, L, S]`` bool mask — True where position is within the window."""
     if cache_positions is None:
@@ -55,20 +55,20 @@ class Attention(nn.Module):
     """
 
     def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        attn_type: AttentionType,
-        rope_base: int = 10_000,
-        rope_scale_factor: float = 1.0,
-        rope_proportion: float = 1.0,
-        sliding_window_size: int | None = None,
-        attn_logits_soft_cap: float | None = None,
-        use_qk_norm: bool = True,
-        use_value_norm: bool = False,
-        k_eq_v: bool = False,
+            self,
+            embed_dim: int,
+            num_heads: int,
+            num_kv_heads: int,
+            head_dim: int,
+            attn_type: AttentionType,
+            rope_base: int = 10_000,
+            rope_scale_factor: float = 1.0,
+            rope_proportion: float = 1.0,
+            sliding_window_size: int | None = None,
+            attn_logits_soft_cap: float | None = None,
+            use_qk_norm: bool = True,
+            use_value_norm: bool = False,
+            k_eq_v: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -107,12 +107,12 @@ class Attention(nn.Module):
 
     @staticmethod
     def init_cache(
-        cache_length: int,
-        num_kv_heads: int,
-        head_dim: int,
-        batch_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-        device: torch.device | str = "cpu",
+            cache_length: int,
+            num_kv_heads: int,
+            head_dim: int,
+            batch_size: int,
+            dtype: torch.dtype = torch.bfloat16,
+            device: torch.device | str = "cpu",
     ) -> LayerCache:
         shape = (batch_size, cache_length, num_kv_heads, head_dim)
         return LayerCache(
@@ -125,12 +125,12 @@ class Attention(nn.Module):
     # ---- forward ---------------------------------------------------------
 
     def forward(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        attn_mask: torch.Tensor,
-        cache: LayerCache | None = None,
-        shared_kv_cache: LayerCache | None = None,
+            self,
+            x: torch.Tensor,
+            positions: torch.Tensor,
+            attn_mask: torch.Tensor,
+            cache: LayerCache | None = None,
+            shared_kv_cache: LayerCache | None = None,
     ) -> tuple[LayerCache | None, torch.Tensor]:
         """
         Args:

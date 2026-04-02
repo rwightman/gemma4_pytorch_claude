@@ -21,9 +21,9 @@ def make_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
 
 
 def make_causal_mask_with_cache(
-    seq_len: int,
-    cache_len: int,
-    device: torch.device,
+        seq_len: int,
+        cache_len: int,
+        device: torch.device,
 ) -> torch.Tensor:
     """``[1, seq_len, cache_len]`` causal mask suitable for cached decoding."""
     mask = torch.ones(seq_len, cache_len, dtype=torch.bool, device=device)
@@ -42,9 +42,9 @@ def make_causal_mask_with_cache(
 # ---------------------------------------------------------------------------
 
 def merge_multimodal_embeddings(
-    text_embeddings: torch.Tensor,
-    mm_embeddings: torch.Tensor,
-    placeholder_mask: torch.Tensor,
+        text_embeddings: torch.Tensor,
+        mm_embeddings: torch.Tensor,
+        placeholder_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Scatter multimodal embeddings into text embedding tensor at placeholder positions.
 
@@ -90,17 +90,17 @@ class Gemma4Model(nn.Module):
             self.audio_encoder = AudioEncoder(cfg.audio)
 
     def forward(
-        self,
-        tokens: torch.Tensor,
-        positions: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        cache: dict | None = None,
-        # Vision inputs
-        image_patches: torch.Tensor | None = None,
-        image_mask: torch.Tensor | None = None,
-        # Audio inputs
-        audio_mel: torch.Tensor | None = None,
-        audio_mel_mask: torch.Tensor | None = None,
+            self,
+            tokens: torch.Tensor,
+            positions: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            cache: dict | None = None,
+            # Vision inputs
+            image_patches: torch.Tensor | None = None,
+            image_mask: torch.Tensor | None = None,
+            # Audio inputs
+            audio_mel: torch.Tensor | None = None,
+            audio_mel_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict | None]:
         """
         Args:

@@ -39,11 +39,11 @@ class Gemma4Tokenizer:
         self._sp.Load(model_path)
 
     def encode(
-        self,
-        text: str,
-        *,
-        add_bos: bool = False,
-        add_eos: bool = False,
+            self,
+            text: str,
+            *,
+            add_bos: bool = False,
+            add_eos: bool = False,
     ) -> list[int]:
         """Encode text to token IDs."""
         ids: list[int] = self._sp.EncodeAsIds(text)

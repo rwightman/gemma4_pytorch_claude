@@ -58,7 +58,7 @@ class Embedder(nn.Module):
         return F.linear(x, self.token_embedding.weight)
 
     def encode_per_layer_input(
-        self, x: torch.Tensor, tokens: torch.Tensor
+            self, x: torch.Tensor, tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Compute per-layer inputs: ``[B, L, num_layers, pli_dim]``.
 
@@ -113,10 +113,10 @@ class TransformerBlock(nn.Module):
     """Single transformer block with optional MoE and per-layer-input."""
 
     def __init__(
-        self,
-        cfg: TextConfig,
-        layer_idx: int,
-        attn_type: AttentionType,
+            self,
+            cfg: TextConfig,
+            layer_idx: int,
+            attn_type: AttentionType,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -203,13 +203,13 @@ class TransformerBlock(nn.Module):
         self.skip_scale = nn.Parameter(torch.ones(1))
 
     def forward(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        attn_mask: torch.Tensor,
-        cache: LayerCache | None = None,
-        shared_kv_cache: LayerCache | None = None,
-        per_layer_input: torch.Tensor | None = None,
+            self,
+            x: torch.Tensor,
+            positions: torch.Tensor,
+            attn_mask: torch.Tensor,
+            cache: LayerCache | None = None,
+            shared_kv_cache: LayerCache | None = None,
+            per_layer_input: torch.Tensor | None = None,
     ) -> tuple[LayerCache | None, torch.Tensor]:
         # --- Attention ---
         residual = x
@@ -283,12 +283,12 @@ class TextDecoder(nn.Module):
         self.final_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        attn_mask: torch.Tensor,
-        per_layer_inputs: torch.Tensor | None = None,
-        cache: dict[str, LayerCache] | None = None,
+            self,
+            x: torch.Tensor,
+            positions: torch.Tensor,
+            attn_mask: torch.Tensor,
+            per_layer_inputs: torch.Tensor | None = None,
+            cache: dict[str, LayerCache] | None = None,
     ) -> tuple[torch.Tensor, dict[str, LayerCache] | None]:
         """
         Args:

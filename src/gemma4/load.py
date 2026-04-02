@@ -2,8 +2,8 @@
 
 Usage::
 
-    from gemma4_pytorch_claude import gemma4_e2b
-    from gemma4_pytorch_claude.load import load_weights
+    from gemma4 import gemma4_e2b
+    from gemma4.load import load_weights
 
     model = gemma4_e2b(text_only=True)
 
@@ -128,12 +128,12 @@ def _load_safetensors_files(path: str | Path) -> dict[str, torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 def load_weights(
-    model: Gemma4Model,
-    path: str | Path,
-    *,
-    format: str = "auto",
-    strict: bool = False,
-    dtype: torch.dtype | None = None,
+        model: Gemma4Model,
+        path: str | Path,
+        *,
+        format: str = "auto",
+        strict: bool = False,
+        dtype: torch.dtype | None = None,
 ) -> tuple[list[str], list[str]]:
     """Load weights into a model from safetensors.
 

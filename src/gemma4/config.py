@@ -24,8 +24,8 @@ class AttentionType(enum.Enum):
 # ---------------------------------------------------------------------------
 
 def make_attention_pattern(
-    pattern: tuple[AttentionType, ...],
-    num_layers: int,
+        pattern: tuple[AttentionType, ...],
+        num_layers: int,
 ) -> tuple[AttentionType, ...]:
     """Tile *pattern* to cover *num_layers*, truncating the last repeat."""
     n = len(pattern)
@@ -35,9 +35,9 @@ def make_attention_pattern(
 
 
 def build_kv_sharing_patterns(
-    num_layers: int,
-    attention_types: Sequence[AttentionType],
-    kv_sharing: KVCacheSharingConfig | None,
+        num_layers: int,
+        attention_types: Sequence[AttentionType],
+        kv_sharing: KVCacheSharingConfig | None,
 ) -> list[int]:
     """Return per-layer index saying *which* layer's KV to reuse.
 

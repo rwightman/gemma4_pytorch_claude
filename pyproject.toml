@@ -1,0 +1,33 @@
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project]
+name = "gemma4-pytorch"
+description = "Canonical PyTorch implementation of Gemma 4"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dynamic = ["version"]
+dependencies = [
+    "torch>=2.1",
+    "sentencepiece",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+convert = ["jax", "orbax-checkpoint", "numpy"]
+dev = ["pytest", "jax", "flax"]
+
+[project.scripts]
+gemma4-convert = "gemma4.convert:main"
+
+[tool.pdm.version]
+source = "file"
+path = "src/gemma4/version.py"
+
+[tool.pdm.build]
+includes = ["src/gemma4"]
+package-dir = "src"
+
+[tool.pdm.dev-dependencies]
+test = ["pytest", "pytest-timeout"]

@@ -24,12 +24,12 @@ class RMSNorm(nn.Module):
     """
 
     def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        with_scale: bool = True,
-        zero_init: bool = False,
-        scale_plus_one: bool = True,
+            self,
+            dim: int,
+            eps: float = 1e-6,
+            with_scale: bool = True,
+            zero_init: bool = False,
+            scale_plus_one: bool = True,
     ):
         super().__init__()
         self.eps = eps
@@ -67,11 +67,11 @@ class RMSNorm(nn.Module):
 # ---------------------------------------------------------------------------
 
 def apply_rope(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    base_frequency: int = 10_000,
-    scale_factor: float = 1.0,
-    rope_proportion: float = 1.0,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        base_frequency: int = 10_000,
+        scale_factor: float = 1.0,
+        rope_proportion: float = 1.0,
 ) -> torch.Tensor:
     """Apply 1-D Rotary Position Embedding.
 
@@ -112,10 +112,10 @@ def apply_rope(
 
 
 def apply_multidimensional_rope(
-    x: torch.Tensor,
-    positions_h: torch.Tensor,
-    positions_w: torch.Tensor,
-    base_frequency: float = 100.0,
+        x: torch.Tensor,
+        positions_h: torch.Tensor,
+        positions_w: torch.Tensor,
+        base_frequency: float = 100.0,
 ) -> torch.Tensor:
     """Apply 2-D factorised RoPE for vision (height, width).
 
