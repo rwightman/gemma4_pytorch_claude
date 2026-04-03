@@ -172,7 +172,10 @@ class Attention(nn.Module):
 
         # --- KV cache update ---
         cache_positions = None
-        if cache is not None and shared_kv_cache is None:
+        if shared_kv_cache is not None:
+            # Reuse positions from the layer we're sharing KV with
+            cache_positions = shared_kv_cache.get("positions")
+        elif cache is not None:
             end = cache["end_index"][0].item()
             cache_len = cache["v"].shape[1]
             idx = end % cache_len

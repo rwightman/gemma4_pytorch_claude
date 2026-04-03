@@ -32,6 +32,8 @@ def _hf_key_to_ours(hf_key: str, num_layers: int) -> str | None:
     """Map a single HF key to our naming convention.
 
     Returns None if the key should be skipped (not part of text decoder).
+    Keys that need special merge handling (gate_proj, up_proj) return a
+    tuple-marker via the ``_hf_convert_weights`` function instead.
     """
     # Strip leading "model.language_model." or "model." prefix
     k = hf_key
@@ -47,6 +49,15 @@ def _hf_key_to_ours(hf_key: str, num_layers: int) -> str | None:
     # --- Final norm ---
     if k == "norm.weight":
         return "text_decoder.final_norm.scale"
+
+    # --- Global PLI (embedder-level) ---
+    _global_pli_map = {
+        "embed_tokens_per_layer.weight": "text_decoder.embedder.pli_embedding.weight",
+        "per_layer_model_projection.weight": "text_decoder.embedder.pli_proj.weight",
+        "per_layer_projection_norm.weight": "text_decoder.embedder.pli_proj_norm.scale",
+    }
+    if k in _global_pli_map:
+        return _global_pli_map[k]
 
     # --- Layer params ---
     if k.startswith("layers."):
@@ -69,13 +80,17 @@ def _hf_key_to_ours(hf_key: str, num_layers: int) -> str | None:
         if rest in _attn_map:
             return f"{prefix}.{_attn_map[rest]}"
 
-        # MLP
+        # MLP — fused gate_up_proj (our format) or separate (handled by merge)
         _mlp_map = {
             "mlp.gate_up_proj.weight": "ffw.gate_up_proj.weight",
             "mlp.down_proj.weight": "ffw.down_proj.weight",
         }
         if rest in _mlp_map:
             return f"{prefix}.{_mlp_map[rest]}"
+
+        # MLP — separate gate_proj / up_proj need merge (handled in _hf_convert_weights)
+        if rest in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):
+            return None  # handled specially
 
         # Norms
         _norm_map = {
@@ -91,16 +106,68 @@ def _hf_key_to_ours(hf_key: str, num_layers: int) -> str | None:
         if rest == "layer_scalar":
             return f"{prefix}.skip_scale"
 
-        # PLI mapping
+        # Per-layer input (PLI) mappings
         _pli_map = {
-            "per_layer_input.gate.weight": "pli_mapping.gate.weight",
-            "per_layer_input.proj.weight": "pli_mapping.proj.weight",
-            "per_layer_input.norm.weight": "pli_mapping.norm.scale",
+            "per_layer_input_gate.weight": "pli_mapping.gate.weight",
+            "per_layer_projection.weight": "pli_mapping.proj.weight",
+            "post_per_layer_input_norm.weight": "pli_mapping.norm.scale",
         }
         if rest in _pli_map:
             return f"{prefix}.{_pli_map[rest]}"
 
     return None
+
+
+def _hf_convert_weights(
+        raw: dict[str, torch.Tensor],
+        num_layers: int,
+) -> dict[str, torch.Tensor]:
+    """Convert HF safetensors keys to our naming, merging gate/up projections."""
+    mapped: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+
+    # Collect gate_proj and up_proj for merging
+    gate_projs: dict[str, torch.Tensor] = {}
+    up_projs: dict[str, torch.Tensor] = {}
+
+    for hf_key, tensor in raw.items():
+        # Check for gate_proj / up_proj that need merging
+        k = hf_key
+        if k.startswith("model.language_model."):
+            k = k[len("model.language_model."):]
+        elif k.startswith("model."):
+            k = k[len("model."):]
+
+        if k.startswith("layers.") and k.endswith(".mlp.gate_proj.weight"):
+            layer_idx = k.split(".")[1]
+            gate_projs[layer_idx] = tensor
+            continue
+        if k.startswith("layers.") and k.endswith(".mlp.up_proj.weight"):
+            layer_idx = k.split(".")[1]
+            up_projs[layer_idx] = tensor
+            continue
+
+        our_key = _hf_key_to_ours(hf_key, num_layers)
+        if our_key is not None:
+            mapped[our_key] = tensor
+        else:
+            skipped.append(hf_key)
+
+    # Merge gate_proj + up_proj → gate_up_proj
+    for layer_idx in gate_projs:
+        gate = gate_projs[layer_idx]
+        up = up_projs.get(layer_idx)
+        if up is None:
+            skipped.append(f"layers.{layer_idx}.mlp.gate_proj.weight (missing up_proj)")
+            continue
+        fused = torch.cat([gate, up], dim=0)
+        our_key = f"text_decoder.blocks.{layer_idx}.ffw.gate_up_proj.weight"
+        mapped[our_key] = fused
+
+    if skipped:
+        print(f"Skipped {len(skipped)} HF keys not in text decoder: {skipped[:10]}...")
+
+    return mapped
 
 
 def _load_safetensors_files(path: str | Path) -> dict[str, torch.Tensor]:
@@ -160,17 +227,7 @@ def load_weights(
 
     if format == "hf":
         num_layers = model.cfg.text.num_layers
-        mapped: dict[str, torch.Tensor] = {}
-        skipped: list[str] = []
-        for hf_key, tensor in raw.items():
-            our_key = _hf_key_to_ours(hf_key, num_layers)
-            if our_key is not None:
-                mapped[our_key] = tensor
-            else:
-                skipped.append(hf_key)
-        if skipped:
-            print(f"Skipped {len(skipped)} HF keys not in text decoder: {skipped[:5]}...")
-        raw = mapped
+        raw = _hf_convert_weights(raw, num_layers)
 
     # Optional dtype cast
     if dtype is not None:

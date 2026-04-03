@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 
 from gemma4.config import AttentionType, Gemma4Config, TextConfig
 from gemma4.model import Gemma4Model
-from gemma4.load import load_weights, _hf_key_to_ours
+from gemma4.load import load_weights, _hf_key_to_ours, _hf_convert_weights
 
 
 class TestHFKeyMapping:
@@ -29,11 +29,21 @@ class TestHFKeyMapping:
         )
         assert result == "text_decoder.blocks.3.attn.q_proj.weight"
 
-    def test_mlp(self):
+    def test_mlp_fused(self):
+        """Our fused gate_up_proj format is directly mapped."""
         result = _hf_key_to_ours(
             "model.language_model.layers.0.mlp.gate_up_proj.weight", 4
         )
         assert result == "text_decoder.blocks.0.ffw.gate_up_proj.weight"
+
+    def test_mlp_separate_returns_none(self):
+        """Separate gate/up are handled by _hf_convert_weights, not _hf_key_to_ours."""
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.mlp.gate_proj.weight", 4
+        ) is None
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.mlp.up_proj.weight", 4
+        ) is None
 
     def test_norms(self):
         result = _hf_key_to_ours(
@@ -60,6 +70,43 @@ class TestHFKeyMapping:
         """Also works with just 'model.' prefix (no 'language_model.')."""
         result = _hf_key_to_ours("model.embed_tokens.weight", 4)
         assert result == "text_decoder.embedder.token_embedding.weight"
+
+    def test_pli_embedder_keys(self):
+        assert _hf_key_to_ours(
+            "model.language_model.embed_tokens_per_layer.weight", 4
+        ) == "text_decoder.embedder.pli_embedding.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.per_layer_model_projection.weight", 4
+        ) == "text_decoder.embedder.pli_proj.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.per_layer_projection_norm.weight", 4
+        ) == "text_decoder.embedder.pli_proj_norm.scale"
+
+    def test_pli_layer_keys(self):
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.per_layer_input_gate.weight", 4
+        ) == "text_decoder.blocks.0.pli_mapping.gate.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.per_layer_projection.weight", 4
+        ) == "text_decoder.blocks.0.pli_mapping.proj.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.post_per_layer_input_norm.weight", 4
+        ) == "text_decoder.blocks.0.pli_mapping.norm.scale"
+
+
+class TestHFConvertWeights:
+    def test_gate_up_merge(self):
+        """gate_proj + up_proj are concatenated into gate_up_proj."""
+        raw = {
+            "model.language_model.layers.0.mlp.gate_proj.weight": torch.randn(4, 2),
+            "model.language_model.layers.0.mlp.up_proj.weight": torch.randn(4, 2),
+            "model.language_model.layers.0.mlp.down_proj.weight": torch.randn(2, 4),
+        }
+        mapped = _hf_convert_weights(raw, num_layers=1)
+        fused = mapped["text_decoder.blocks.0.ffw.gate_up_proj.weight"]
+        assert fused.shape == (8, 2)
+        assert torch.equal(fused[:4], raw["model.language_model.layers.0.mlp.gate_proj.weight"])
+        assert torch.equal(fused[4:], raw["model.language_model.layers.0.mlp.up_proj.weight"])
 
 
 class TestLoadWeights:

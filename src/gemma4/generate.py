@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from .attention import Attention
-from .config import Gemma4Config, make_attention_pattern
+from .config import AttentionType, Gemma4Config, make_attention_pattern
 from .model import Gemma4Model
 
 
@@ -49,10 +49,13 @@ def init_cache(
     attn_types = make_attention_pattern(text.attention_pattern, text.num_layers)
     cache = {}
     for i in range(text.num_layers):
+        is_global = attn_types[i] == AttentionType.GLOBAL
+        layer_head_dim = (text.global_head_dim or text.head_dim) if is_global else text.head_dim
+        layer_kv_heads = (text.num_global_kv_heads or text.num_kv_heads) if is_global else text.num_kv_heads
         cache[f"layer_{i}"] = Attention.init_cache(
             cache_length=cache_length,
-            num_kv_heads=text.num_kv_heads,
-            head_dim=text.head_dim,
+            num_kv_heads=layer_kv_heads,
+            head_dim=layer_head_dim,
             batch_size=batch_size,
             dtype=dtype,
             device=device,
@@ -69,6 +72,7 @@ def generate(
         top_k: int = 0,
         top_p: float = 1.0,
         cache_length: int | None = None,
+        stop_tokens: set[int] | None = None,
         # Optional multimodal inputs (only for prefill)
         image_patches: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
@@ -85,10 +89,14 @@ def generate(
         top_k: top-k filtering (0 = disabled).
         top_p: nucleus sampling threshold (1.0 = disabled).
         cache_length: KV cache length (defaults to prompt + max_new_tokens).
+        stop_tokens: set of token IDs that trigger early stopping.
 
     Returns:
-        ``[B, L + max_new_tokens]`` — prompt + generated tokens.
+        ``[B, L + generated]`` — prompt + generated tokens.
     """
+    if stop_tokens is None:
+        stop_tokens = {1, 106}  # EOS, END_OF_TURN
+
     B, L = tokens.shape
     device = tokens.device
     cfg = model.cfg
@@ -114,6 +122,9 @@ def generate(
     next_token = _sample_token(next_logits, temperature, top_k, top_p)
     generated = [next_token]
 
+    if next_token.item() in stop_tokens:
+        return torch.cat([tokens, torch.stack(generated, dim=1)], dim=1)
+
     # --- Decode loop ---
     for _ in range(max_new_tokens - 1):
         inp = next_token.unsqueeze(1)  # [B, 1]
@@ -121,6 +132,8 @@ def generate(
         next_logits = logits[:, -1, :]
         next_token = _sample_token(next_logits, temperature, top_k, top_p)
         generated.append(next_token)
+        if next_token.item() in stop_tokens:
+            break
 
     return torch.cat([tokens, torch.stack(generated, dim=1)], dim=1)
 
@@ -183,8 +196,11 @@ def chat(
         top_p=top_p,
     )
 
-    # Decode only the newly generated tokens, strip EOS if present
+    # Decode only the newly generated tokens, strip stop tokens
     gen_ids = output[0, prompt_len:].tolist()
-    if tokenizer.EOS in gen_ids:
-        gen_ids = gen_ids[: gen_ids.index(tokenizer.EOS)]
+    stop_ids = {tokenizer.EOS, tokenizer.END_OF_TURN}
+    for i, tid in enumerate(gen_ids):
+        if tid in stop_ids:
+            gen_ids = gen_ids[:i]
+            break
     return tokenizer.decode(gen_ids)

@@ -117,10 +117,19 @@ class TransformerBlock(nn.Module):
             cfg: TextConfig,
             layer_idx: int,
             attn_type: AttentionType,
+            *,
+            head_dim: int | None = None,
+            num_kv_heads: int | None = None,
+            hidden_dim: int | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn_type = attn_type
+
+        # Resolve per-layer dimensions (global layers can differ)
+        effective_head_dim = head_dim or cfg.head_dim
+        effective_kv_heads = num_kv_heads or cfg.num_kv_heads
+        effective_hidden = hidden_dim or cfg.hidden_dim
 
         # Choose RoPE base by layer type
         rope_base = (
@@ -146,8 +155,8 @@ class TransformerBlock(nn.Module):
         self.attn = Attention(
             embed_dim=cfg.embed_dim,
             num_heads=cfg.num_heads,
-            num_kv_heads=cfg.num_kv_heads,
-            head_dim=cfg.head_dim,
+            num_kv_heads=effective_kv_heads,
+            head_dim=effective_head_dim,
             attn_type=attn_type,
             rope_base=rope_base,
             rope_scale_factor=rope_scale,
@@ -177,7 +186,7 @@ class TransformerBlock(nn.Module):
                 RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
             )
             # Dense branch (parallel to MoE)
-            dense_hid = cfg.moe.dense_hidden_dim if cfg.moe.dense_hidden_dim > 0 else cfg.hidden_dim
+            dense_hid = cfg.moe.dense_hidden_dim if cfg.moe.dense_hidden_dim > 0 else effective_hidden
             self.pre_ffw2_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
             self.mlp2 = GatedMLP(cfg.embed_dim, dense_hid)
             self.post_ffw2_norm = (
@@ -188,7 +197,7 @@ class TransformerBlock(nn.Module):
                 RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
             )
         else:
-            self.ffw = GatedMLP(cfg.embed_dim, cfg.hidden_dim)
+            self.ffw = GatedMLP(cfg.embed_dim, effective_hidden)
             self.post_ffw_norm = (
                 RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
             )
@@ -274,11 +283,25 @@ class TextDecoder(nn.Module):
             cfg.num_layers, attn_types, cfg.kv_sharing
         )
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList([
-            TransformerBlock(cfg, i, attn_types[i])
-            for i in range(cfg.num_layers)
-        ])
+        # Transformer blocks — resolve per-layer dimensions
+        blocks: list[TransformerBlock] = []
+        for i in range(cfg.num_layers):
+            is_global = attn_types[i] == AttentionType.GLOBAL
+            is_shared = self.kv_sharing_patterns[i] != i
+
+            layer_head_dim = (cfg.global_head_dim or cfg.head_dim) if is_global else cfg.head_dim
+            layer_kv_heads = (cfg.num_global_kv_heads or cfg.num_kv_heads) if is_global else cfg.num_kv_heads
+            layer_hidden = cfg.hidden_dim
+            if is_shared and cfg.override_kv_shared_ffw_hidden is not None:
+                layer_hidden = cfg.override_kv_shared_ffw_hidden
+
+            blocks.append(TransformerBlock(
+                cfg, i, attn_types[i],
+                head_dim=layer_head_dim,
+                num_kv_heads=layer_kv_heads,
+                hidden_dim=layer_hidden,
+            ))
+        self.blocks = nn.ModuleList(blocks)
 
         self.final_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
 

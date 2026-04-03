@@ -1,19 +1,28 @@
-"""Gemma4 tokenizer — thin SentencePiece wrapper.
+"""Gemma4 tokenizer — supports SentencePiece ``.model`` and HuggingFace ``tokenizer.json``.
 
 Matches the JAX ``gm.text._tokenizer.Gemma4Tokenizer`` API.
 """
 
 from __future__ import annotations
 
-import sentencepiece as spm
+from pathlib import Path
 
 
 class Gemma4Tokenizer:
-    """Lightweight SentencePiece wrapper for Gemma 4.
+    """Lightweight tokenizer for Gemma 4.
+
+    Supports two backends:
+
+    * **SentencePiece**: pass a path to a ``.model`` file.
+    * **HuggingFace tokenizers**: pass a path to a ``tokenizer.json`` file
+      or a directory containing one.
 
     Usage::
 
         tok = Gemma4Tokenizer("/path/to/gemma4.model")
+        # or
+        tok = Gemma4Tokenizer("/path/to/hf-model-dir/")
+
         ids = tok.encode("Hello!", add_bos=True)
         text = tok.decode(ids)
     """
@@ -35,8 +44,42 @@ class Gemma4Tokenizer:
     BEGIN_OF_TOOL_RESPONSE = 50
 
     def __init__(self, model_path: str) -> None:
+        p = Path(model_path)
+
+        # Determine backend
+        if p.is_dir():
+            json_path = p / "tokenizer.json"
+            model_path_sp = p / "tokenizer.model"
+            if json_path.exists():
+                self._backend = "hf"
+                self._init_hf(str(json_path))
+            elif model_path_sp.exists():
+                self._backend = "sp"
+                self._init_sp(str(model_path_sp))
+            else:
+                raise FileNotFoundError(
+                    f"No tokenizer.json or tokenizer.model found in {p}"
+                )
+        elif p.suffix == ".json":
+            self._backend = "hf"
+            self._init_hf(str(p))
+        elif p.suffix == ".model":
+            self._backend = "sp"
+            self._init_sp(str(p))
+        else:
+            raise ValueError(
+                f"Unknown tokenizer file type: {p.suffix}. "
+                "Expected .model (SentencePiece) or .json (HuggingFace)."
+            )
+
+    def _init_sp(self, path: str) -> None:
+        import sentencepiece as spm
         self._sp = spm.SentencePieceProcessor()
-        self._sp.Load(model_path)
+        self._sp.Load(path)
+
+    def _init_hf(self, path: str) -> None:
+        from tokenizers import Tokenizer
+        self._hf_tok = Tokenizer.from_file(path)
 
     def encode(
             self,
@@ -46,7 +89,11 @@ class Gemma4Tokenizer:
             add_eos: bool = False,
     ) -> list[int]:
         """Encode text to token IDs."""
-        ids: list[int] = self._sp.EncodeAsIds(text)
+        if self._backend == "sp":
+            ids: list[int] = self._sp.EncodeAsIds(text)
+        else:
+            encoding = self._hf_tok.encode(text, add_special_tokens=False)
+            ids = encoding.ids
         if add_bos:
             ids.insert(0, self.BOS)
         if add_eos:
@@ -57,8 +104,14 @@ class Gemma4Tokenizer:
         """Decode token IDs back to text."""
         if isinstance(ids, int):
             ids = [ids]
-        return self._sp.DecodeIds(ids)
+        if self._backend == "sp":
+            return self._sp.DecodeIds(ids)
+        else:
+            return self._hf_tok.decode(ids, skip_special_tokens=False)
 
     @property
     def vocab_size(self) -> int:
-        return self._sp.GetPieceSize()
+        if self._backend == "sp":
+            return self._sp.GetPieceSize()
+        else:
+            return self._hf_tok.get_vocab_size()
