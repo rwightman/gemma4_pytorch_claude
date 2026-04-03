@@ -2,8 +2,8 @@
 
 Usage::
 
-    from gemma4 import gemma4_e2b
-    from gemma4.load import load_weights
+    from gemma4_pt_claude import gemma4_e2b
+    from gemma4_pt_claude.load import load_weights
 
     model = gemma4_e2b(text_only=True)
 

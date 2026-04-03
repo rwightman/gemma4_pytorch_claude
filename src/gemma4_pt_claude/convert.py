@@ -6,7 +6,7 @@ Usage::
     gemma4-convert --checkpoint /path/to/orbax --variant e2b --output model.safetensors
 
     # As Python API:
-    from gemma4.convert import convert_orbax
+    from gemma4_pt_claude.convert import convert_orbax
     convert_orbax("/path/to/orbax", "e2b", "model.safetensors")
 """
 
@@ -87,7 +87,7 @@ def _load_orbax_checkpoint(checkpoint_path: str) -> dict:
     except ImportError:
         raise ImportError(
             "orbax-checkpoint is required for conversion. "
-            "Install with: pip install 'gemma4-pytorch[convert]'"
+            "Install with: pip install 'gemma4-pt-claude[convert]'"
         )
 
     ckpt_path = Path(checkpoint_path)

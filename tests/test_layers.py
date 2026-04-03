@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from gemma4.layers import RMSNorm, GatedMLP, apply_rope, apply_multidimensional_rope
+from gemma4_pt_claude.layers import RMSNorm, GatedMLP, apply_rope, apply_multidimensional_rope
 
 
 class TestRMSNorm:

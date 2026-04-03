@@ -2,7 +2,7 @@
 
 import pytest
 
-from gemma4.config import (
+from gemma4_pt_claude.config import (
     AttentionType,
     Gemma4Config,
     KVCacheSharingConfig,
@@ -10,7 +10,7 @@ from gemma4.config import (
     build_kv_sharing_patterns,
     make_attention_pattern,
 )
-from gemma4.factory import gemma4_e2b, gemma4_e4b, gemma4_31b, gemma4_26b_a4b
+from gemma4_pt_claude.factory import gemma4_e2b, gemma4_e4b, gemma4_31b, gemma4_26b_a4b
 
 
 class TestAttentionPattern:

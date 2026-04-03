@@ -3,9 +3,9 @@
 import torch
 import pytest
 
-from gemma4.config import AttentionType, Gemma4Config, TextConfig
-from gemma4.model import Gemma4Model, make_causal_mask, make_causal_mask_with_cache
-from gemma4.generate import generate, init_cache
+from gemma4_pt_claude.config import AttentionType, Gemma4Config, TextConfig
+from gemma4_pt_claude.model import Gemma4Model, make_causal_mask, make_causal_mask_with_cache
+from gemma4_pt_claude.generate import generate, init_cache
 
 
 def _tiny_config() -> Gemma4Config:

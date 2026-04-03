@@ -3,8 +3,8 @@
 import torch
 import pytest
 
-from gemma4.attention import Attention, LayerCache, create_sliding_mask
-from gemma4.config import AttentionType
+from gemma4_pt_claude.attention import Attention, LayerCache, create_sliding_mask
+from gemma4_pt_claude.config import AttentionType
 
 
 class TestSlidingMask:

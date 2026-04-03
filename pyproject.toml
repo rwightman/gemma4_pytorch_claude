@@ -3,7 +3,7 @@ requires = ["pdm-backend"]
 build-backend = "pdm.backend"
 
 [project]
-name = "gemma4-pytorch"
+name = "gemma4-pt-claude"
 description = "Canonical PyTorch implementation of Gemma 4"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
@@ -19,14 +19,14 @@ convert = ["jax", "orbax-checkpoint", "numpy"]
 dev = ["pytest", "jax", "flax"]
 
 [project.scripts]
-gemma4-convert = "gemma4.convert:main"
+gemma4-convert = "gemma4_pt_claude.convert:main"
 
 [tool.pdm.version]
 source = "file"
-path = "src/gemma4/version.py"
+path = "src/gemma4_pt_claude/version.py"
 
 [tool.pdm.build]
-includes = ["src/gemma4"]
+includes = ["src/gemma4_pt_claude"]
 package-dir = "src"
 
 [tool.pdm.dev-dependencies]

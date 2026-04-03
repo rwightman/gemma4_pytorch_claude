@@ -7,9 +7,9 @@ import torch
 import pytest
 from safetensors.torch import save_file
 
-from gemma4.config import AttentionType, Gemma4Config, TextConfig
-from gemma4.model import Gemma4Model
-from gemma4.load import load_weights, _hf_key_to_ours, _hf_convert_weights
+from gemma4_pt_claude.config import AttentionType, Gemma4Config, TextConfig
+from gemma4_pt_claude.model import Gemma4Model
+from gemma4_pt_claude.load import load_weights, _hf_key_to_ours, _hf_convert_weights
 
 
 class TestHFKeyMapping:

@@ -3,7 +3,7 @@
 import torch
 import pytest
 
-from gemma4.moe import MoERouter, MoEExperts, MoELayer
+from gemma4_pt_claude.moe import MoERouter, MoEExperts, MoELayer
 
 
 class TestMoERouter:

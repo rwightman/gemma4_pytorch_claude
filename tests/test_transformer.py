@@ -3,8 +3,8 @@
 import torch
 import pytest
 
-from gemma4.config import AttentionType, TextConfig
-from gemma4.transformer import Embedder, PerLayerMapping, TransformerBlock, TextDecoder
+from gemma4_pt_claude.config import AttentionType, TextConfig
+from gemma4_pt_claude.transformer import Embedder, PerLayerMapping, TransformerBlock, TextDecoder
 
 
 def _small_text_config(**overrides) -> TextConfig:
@@ -124,7 +124,7 @@ class TestTextDecoder:
         B, L, cache_len = 1, 4, 16
 
         # Build cache
-        from gemma4.attention import Attention
+        from gemma4_pt_claude.attention import Attention
         cache = {}
         for i in range(cfg.num_layers):
             cache[f"layer_{i}"] = Attention.init_cache(cache_len, 2, 16, B)
