@@ -180,6 +180,9 @@ class TextConfig:
     # Override FFW hidden dim for KV-shared layers
     override_kv_shared_ffw_hidden: int | None = None
 
+    # Attention implementation: "sdpa" (F.scaled_dot_product_attention) or "eager" (manual einsum)
+    attn_impl: str = "sdpa"
+
 
 # ---------------------------------------------------------------------------
 # Top-level config

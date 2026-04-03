@@ -69,6 +69,7 @@ class Attention(nn.Module):
             use_qk_norm: bool = True,
             use_value_norm: bool = False,
             k_eq_v: bool = False,
+            attn_impl: str = "sdpa",
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -81,6 +82,7 @@ class Attention(nn.Module):
         self.sliding_window_size = sliding_window_size
         self.attn_logits_soft_cap = attn_logits_soft_cap
         self.k_eq_v = k_eq_v
+        self.attn_impl = attn_impl
         self.groups = num_heads // num_kv_heads  # GQA group count
 
         # Projections
@@ -186,20 +188,6 @@ class Attention(nn.Module):
             v = cache["v"].to(q.dtype)
             cache_positions = cache["positions"]
 
-        # --- Attention logits (GQA via reshape) ---
-        if self.groups > 1:
-            # q: [B, L, kv_heads, groups, H]   k: [B, S, kv_heads, H]
-            q = q.view(B, L, self.num_kv_heads, self.groups, self.head_dim)
-            logits = torch.einsum("blkgh,bskh->blkgs", q, k)
-            B2, L2, K2, G2, S2 = logits.shape
-            logits = logits.reshape(B2, L2, K2 * G2, S2)
-        else:
-            logits = torch.einsum("blnh,bsnh->blns", q, k)
-
-        # --- Softcap ---
-        if self.attn_logits_soft_cap is not None:
-            logits = torch.tanh(logits / self.attn_logits_soft_cap) * self.attn_logits_soft_cap
-
         # --- Sliding window mask ---
         if self.attn_type == AttentionType.LOCAL_SLIDING:
             assert self.sliding_window_size is not None
@@ -210,17 +198,15 @@ class Attention(nn.Module):
             )
             attn_mask = attn_mask & slide
 
-        # --- Masked softmax ---
-        padded = torch.where(attn_mask.unsqueeze(-2), logits, K_MASK)
-        probs = F.softmax(padded, dim=-1).to(k.dtype)
-
-        # --- Weighted sum ---
-        if self.groups > 1:
-            probs = probs.view(B, L, self.num_kv_heads, self.groups, -1)
-            out = torch.einsum("blkgs,bskh->blkgh", probs, v)
-            out = out.reshape(B, L, self.num_heads, self.head_dim)
+        # --- Compute attention (SDPA or eager) ---
+        use_sdpa = (
+            self.attn_impl == "sdpa"
+            and self.attn_logits_soft_cap is None
+        )
+        if use_sdpa:
+            out = self._sdpa_attention(q, k, v, attn_mask)
         else:
-            out = torch.einsum("blns,bsnh->blnh", probs, v)
+            out = self._eager_attention(q, k, v, attn_mask)
 
         out = out.reshape(B, L, -1)
         out = self.o_proj(out)
@@ -242,3 +228,89 @@ class Attention(nn.Module):
             new_cache = {"k": k, "v": v}
 
         return new_cache, out
+
+    # ---- attention backends ----------------------------------------------
+
+    def _sdpa_attention(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """SDPA path using ``F.scaled_dot_product_attention``.
+
+        Args:
+            q: ``[B, L, num_heads, head_dim]``
+            k: ``[B, S, num_kv_heads, head_dim]``
+            v: ``[B, S, num_kv_heads, head_dim]``
+            attn_mask: ``[B, L, S]`` bool (True = attend)
+
+        Returns:
+            ``[B, L, num_heads, head_dim]``
+        """
+        # Transpose to [B, H, L/S, D] for SDPA
+        q = q.transpose(1, 2)  # [B, num_heads, L, head_dim]
+        k = k.transpose(1, 2)  # [B, num_kv_heads, S, head_dim]
+        v = v.transpose(1, 2)  # [B, num_kv_heads, S, head_dim]
+
+        # Convert bool mask [B, L, S] → [B, 1, L, S] for SDPA broadcast over heads
+        sdpa_mask = attn_mask.unsqueeze(1)
+
+        # enable_gqa=True lets SDPA handle mismatched Q/KV head counts natively
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=sdpa_mask,
+            scale=self.query_pre_attn_scalar,
+            enable_gqa=True,
+        )
+        # Back to [B, L, num_heads, head_dim]
+        return out.transpose(1, 2)
+
+    def _eager_attention(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Eager (manual einsum) attention path.
+
+        Args:
+            q: ``[B, L, num_heads, head_dim]``
+            k: ``[B, S, num_kv_heads, head_dim]``
+            v: ``[B, S, num_kv_heads, head_dim]``
+            attn_mask: ``[B, L, S]`` bool (True = attend)
+
+        Returns:
+            ``[B, L, num_heads, head_dim]``
+        """
+        B = q.shape[0]
+        L = q.shape[1]
+
+        # Attention logits (GQA via reshape)
+        if self.groups > 1:
+            q_r = q.view(B, L, self.num_kv_heads, self.groups, self.head_dim)
+            logits = torch.einsum("blkgh,bskh->blkgs", q_r, k)
+            B2, L2, K2, G2, S2 = logits.shape
+            logits = logits.reshape(B2, L2, K2 * G2, S2)
+        else:
+            logits = torch.einsum("blnh,bsnh->blns", q, k)
+
+        # Softcap
+        if self.attn_logits_soft_cap is not None:
+            logits = torch.tanh(logits / self.attn_logits_soft_cap) * self.attn_logits_soft_cap
+
+        # Masked softmax
+        padded = torch.where(attn_mask.unsqueeze(-2), logits, K_MASK)
+        probs = F.softmax(padded, dim=-1).to(k.dtype)
+
+        # Weighted sum
+        if self.groups > 1:
+            probs = probs.view(B, L, self.num_kv_heads, self.groups, -1)
+            out = torch.einsum("blkgs,bskh->blkgh", probs, v)
+            out = out.reshape(B, L, self.num_heads, self.head_dim)
+        else:
+            out = torch.einsum("blns,bsnh->blnh", probs, v)
+
+        return out

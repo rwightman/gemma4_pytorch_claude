@@ -166,6 +166,7 @@ class TransformerBlock(nn.Module):
             use_qk_norm=cfg.use_qk_norm,
             use_value_norm=cfg.use_value_norm,
             k_eq_v=cfg.k_eq_v,
+            attn_impl=cfg.attn_impl,
         )
         self.post_attn_norm = (
             RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_attn_norm else None
