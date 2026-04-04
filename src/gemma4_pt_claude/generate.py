@@ -74,7 +74,8 @@ def generate(
         cache_length: int | None = None,
         stop_tokens: set[int] | None = None,
         # Optional multimodal inputs (only for prefill)
-        image_patches: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_position_ids: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         audio_mel: torch.Tensor | None = None,
         audio_mel_mask: torch.Tensor | None = None,
@@ -111,7 +112,8 @@ def generate(
     logits, cache = model(
         tokens,
         cache=cache,
-        image_patches=image_patches,
+        pixel_values=pixel_values,
+        image_position_ids=image_position_ids,
         image_mask=image_mask,
         audio_mel=audio_mel,
         audio_mel_mask=audio_mel_mask,

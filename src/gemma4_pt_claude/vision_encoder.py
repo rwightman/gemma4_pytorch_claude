@@ -1,210 +1,344 @@
-"""Standalone vision encoder (SigLiP-style) with 2-D RoPE and spatial pooling.
+"""Gemma4 vision encoder: patchify → transformer blocks → spatial pooling.
 
-Owns its own projection to text embedding space, so it can be instantiated
-and used independently of the text decoder.
+Ported from the JAX reference: ``gemma/gm/nn/gemma4/vision/``.
+Uses factorised 2-D positional embeddings, QK/V-norm, gated MLP,
+multidimensional RoPE, and position-aware spatial pooling.
 """
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import VisionConfig
-from .layers import GatedMLP, RMSNorm, apply_multidimensional_rope
+from .layers import ClippedLinear, RMSNorm, apply_multidimensional_rope
 
 
 # ---------------------------------------------------------------------------
-# Patch embedding + factorised 2-D positional embedding
+# Helpers
 # ---------------------------------------------------------------------------
 
-class VisionPatchEmbed(nn.Module):
+def _make_vision_proj(
+        cfg: VisionConfig,
+        in_features: int,
+        out_features: int,
+) -> ClippedLinear | nn.Linear:
+    """Build a projection layer — ClippedLinear when the config asks for it."""
+    if cfg.use_clipped_linear:
+        return ClippedLinear(in_features, out_features, bias=False)
+    return nn.Linear(in_features, out_features, bias=False)
+
+
+# ---------------------------------------------------------------------------
+# Patch embedder with factorised 2-D positional embedding
+# ---------------------------------------------------------------------------
+
+class VisionPatchEmbedder(nn.Module):
     def __init__(self, cfg: VisionConfig):
         super().__init__()
-        patch_dim = cfg.patch_size ** 2 * 3
-        self.proj = nn.Linear(patch_dim, cfg.d_model, bias=True)
-
-        num_patches_side = cfg.image_size // cfg.patch_size
-        num_patches = num_patches_side ** 2
-        # Learnable position embedding
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, num_patches, cfg.d_model) * (1.0 / math.sqrt(cfg.d_model))
+        self.cfg = cfg
+        patch_dim = 3 * cfg.patch_size ** 2
+        self.input_proj = nn.Linear(patch_dim, cfg.d_model, bias=False)
+        self.position_embedding_table = nn.Parameter(
+            torch.ones(2, cfg.position_embedding_size, cfg.d_model),
         )
-        self.num_patches_side = num_patches_side
 
-    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+    def _position_embeddings(
+            self,
+            position_ids: torch.Tensor,
+            padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute factorised positional embeddings from 2-D coords.
+
+        Args:
+            position_ids: ``[B, L, 2]`` (x, y).
+            padding_mask: ``[B, L]`` True where padding.
+        """
+        clamped = position_ids.clamp(min=0)  # [B, L, 2]
+        one_hot = F.one_hot(
+            clamped, num_classes=self.cfg.position_embedding_size,
+        )  # [B, L, 2, pos_size]
+        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)  # [B, 2, L, pos_size]
+        pos_emb = one_hot @ self.position_embedding_table  # [B, 2, L, d_model]
+        pos_emb = pos_emb.sum(dim=1)  # [B, L, d_model]
+        pos_emb = torch.where(padding_mask.unsqueeze(-1), 0.0, pos_emb)
+        return pos_emb
+
+    def forward(
+            self,
+            pixel_values: torch.Tensor,
+            position_ids: torch.Tensor,
+            padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            patches: ``[B, num_patches, patch_dim]`` — already-patchified pixels.
-
-        Returns:
-            ``[B, num_patches, d_model]``
+            pixel_values: ``[B, L, patch_dim]`` raw patch pixels in [0,1].
+            position_ids: ``[B, L, 2]``.
+            padding_mask: ``[B, L]`` True for padding patches.
         """
-        x = self.proj(patches)
-        x = x + self.pos_embedding[:, : x.shape[1]]
-        return x
+        pixel_values = 2.0 * (pixel_values - 0.5)
+        hidden = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
+        pos_emb = self._position_embeddings(position_ids, padding_mask)
+        return hidden + pos_emb
 
 
 # ---------------------------------------------------------------------------
-# Vision attention block with 2-D RoPE + QK/V-norm
+# Vision MLP (gated, separate gate/up/down)
+# ---------------------------------------------------------------------------
+
+class VisionMLP(nn.Module):
+    def __init__(self, cfg: VisionConfig):
+        super().__init__()
+        self.gate_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden)
+        self.up_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden)
+        self.down_proj = _make_vision_proj(cfg, cfg.ffw_hidden, cfg.d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
+
+
+# ---------------------------------------------------------------------------
+# Vision attention (full MHA with 2-D RoPE + QK/V-norm)
 # ---------------------------------------------------------------------------
 
 class VisionAttention(nn.Module):
     def __init__(self, cfg: VisionConfig):
         super().__init__()
         self.num_heads = cfg.num_heads
-        self.head_dim = cfg.d_model // cfg.num_heads
+        self.head_dim = cfg.head_dim
         self.d_model = cfg.d_model
+        self.rope_base_frequency = cfg.rope_base_frequency
 
-        self.q_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
-        self.kv_proj = nn.Linear(cfg.d_model, cfg.d_model * 2, bias=True)
-        self.o_proj = nn.Linear(cfg.d_model, cfg.d_model, bias=True)
+        self.q_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim)
+        self.k_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim)
+        self.v_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim)
+        self.o_proj = _make_vision_proj(cfg, cfg.num_heads * cfg.head_dim, cfg.d_model)
 
-        # QK-norm with zero-init scale (vision style)
-        self.q_norm = RMSNorm(self.head_dim, zero_init=True)
-        self.k_norm = RMSNorm(self.head_dim, zero_init=True)
-        # V-norm without scale
-        self.v_norm = RMSNorm(self.head_dim, with_scale=False)
+        self.q_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, scale_plus_one=False)
+        self.k_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, scale_plus_one=False)
+        self.v_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, with_scale=False)
 
-        self.scale = 1.0  # QK-norm replaces 1/sqrt(d)
-        self.num_patches_side = cfg.image_size // cfg.patch_size
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, D = x.shape
-        N = self.num_heads
-        H = self.head_dim
-        S = self.num_patches_side
+    def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: ``[B, L, D]``.
+            attention_mask: ``[B, 1, L, L]`` additive mask (0 attend, -inf ignore).
+            position_ids: ``[B, L, 2]`` — (x, y) patch coords.
+        """
+        B, L, _ = x.shape
+        N, H = self.num_heads, self.head_dim
 
         q = self.q_proj(x).view(B, L, N, H)
-        kv = self.kv_proj(x).view(B, L, 2, N, H)
-        k, v = kv[:, :, 0], kv[:, :, 1]
+        k = self.k_proj(x).view(B, L, N, H)
+        v = self.v_proj(x).view(B, L, N, H)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
         v = self.v_norm(v)
 
-        # 2-D RoPE: build row/col position vectors
-        device = x.device
-        rows = torch.arange(S, device=device).unsqueeze(1).expand(S, S).reshape(-1)
-        cols = torch.arange(S, device=device).unsqueeze(0).expand(S, S).reshape(-1)
-        # Expand to batch: [1, L]
-        rows = rows.unsqueeze(0).expand(B, -1)[:, :L]
-        cols = cols.unsqueeze(0).expand(B, -1)[:, :L]
+        # 2-D RoPE: first half ↔ positions[..., 0] (x/width),
+        #           second half ↔ positions[..., 1] (y/height).
+        # Matches JAX: apply_multidimensional_rope splits head_dim and applies
+        # apply_rope to each spatial dimension independently.
+        q = apply_multidimensional_rope(
+            q, position_ids[:, :, 0], position_ids[:, :, 1],
+            base_frequency=self.rope_base_frequency,
+        )
+        k = apply_multidimensional_rope(
+            k, position_ids[:, :, 0], position_ids[:, :, 1],
+            base_frequency=self.rope_base_frequency,
+        )
 
-        q = apply_multidimensional_rope(q, rows, cols, base_frequency=100.0)
-        k = apply_multidimensional_rope(k, rows, cols, base_frequency=100.0)
-
-        q = q * self.scale
-
-        # Standard attention
-        q = q.transpose(1, 2)  # [B, N, L, H]
+        # Transpose to [B, N, L, H] for attention
+        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        attn = torch.matmul(q, k.transpose(-2, -1))
-        attn = F.softmax(attn, dim=-1).to(v.dtype)
-        out = torch.matmul(attn, v)  # [B, N, L, H]
-        out = out.transpose(1, 2).reshape(B, L, D)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1))
+        attn_weights = attn_weights + attention_mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
+
+        out = torch.matmul(attn_weights, v)  # [B, N, L, H]
+        out = out.transpose(1, 2).reshape(B, L, N * H)
         return self.o_proj(out)
 
 
-class VisionBlock(nn.Module):
-    """Single vision transformer block with zero-init norms."""
+# ---------------------------------------------------------------------------
+# Vision transformer block
+# ---------------------------------------------------------------------------
 
+class VisionBlock(nn.Module):
+    def __init__(self, cfg: VisionConfig, layer_idx: int):
+        super().__init__()
+        self.pre_attn_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
+        self.post_attn_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
+        self.pre_ffw_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
+        self.post_ffw_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
+        self.attn = VisionAttention(cfg)
+        self.mlp = VisionMLP(cfg)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            attention_mask: torch.Tensor,
+            position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = x
+        x = self.pre_attn_norm(x)
+        x = self.attn(x, attention_mask, position_ids)
+        x = self.post_attn_norm(x)
+        x = residual + x
+
+        residual = x
+        x = self.pre_ffw_norm(x)
+        x = self.mlp(x)
+        x = self.post_ffw_norm(x)
+        x = residual + x
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Spatial pooler (position-aware average pooling)
+# ---------------------------------------------------------------------------
+
+class VisionPooler(nn.Module):
     def __init__(self, cfg: VisionConfig):
         super().__init__()
-        self.pre_attn_norm = nn.LayerNorm(cfg.d_model)
-        self.attn = VisionAttention(cfg)
-        self.pre_ffw_norm = nn.LayerNorm(cfg.d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(cfg.d_model, cfg.mlp_dim, bias=True),
-            nn.GELU(),
-            nn.Linear(cfg.mlp_dim, cfg.d_model, bias=True),
-        )
+        self.root_hidden_size = cfg.d_model ** 0.5
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.pre_attn_norm(x))
-        x = x + self.mlp(self.pre_ffw_norm(x))
-        return x
+    def _avg_pool_by_positions(
+            self,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            output_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Position-based spatial average pooling.
+
+        Groups patches into ``k x k`` grid cells based on their (x, y) coords
+        and averages within each cell.
+
+        Returns:
+            ``(pooled [B, output_length, D], mask [B, output_length] bool)``.
+        """
+        input_len = hidden_states.shape[1]
+        k = int((input_len / output_length) ** 0.5)
+        k_squared = k * k
+
+        clamped = position_ids.clamp(min=0)  # [B, L, 2]
+        max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1  # [B, 1]
+        kernel_idxs = torch.div(clamped, k, rounding_mode="floor")  # [B, L, 2]
+        kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]  # [B, L]
+
+        weights = F.one_hot(kernel_idxs.long(), output_length).float() / k_squared  # [B, L, output_length]
+        pooled = weights.transpose(1, 2) @ hidden_states.float()  # [B, output_length, D]
+        mask = ~(weights == 0).all(dim=1)  # [B, output_length]
+        return pooled.to(hidden_states.dtype), mask
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_ids: torch.Tensor,
+            padding_mask: torch.Tensor,
+            output_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: ``[B, L, D]``.
+            position_ids: ``[B, L, 2]``.
+            padding_mask: ``[B, L]`` True=padding.
+            output_length: target number of soft tokens.
+
+        Returns:
+            ``(hidden_states, pooler_mask)`` where pooler_mask is ``[B, output_length]``
+            with True=valid, False=padding.
+        """
+        hidden_states = hidden_states.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+        if hidden_states.shape[1] != output_length:
+            hidden_states, valid_mask = self._avg_pool_by_positions(
+                hidden_states, position_ids, output_length,
+            )
+        else:
+            valid_mask = ~padding_mask
+
+        hidden_states = hidden_states * self.root_hidden_size
+        return hidden_states, valid_mask
 
 
 # ---------------------------------------------------------------------------
-# Spatial pooling (avg-pool to output_length)
-# ---------------------------------------------------------------------------
-
-class SpatialPool(nn.Module):
-    """Avg-pool spatial tokens from L to output_length, then scale by sqrt(d)."""
-
-    def __init__(self, output_length: int, d_model: int):
-        super().__init__()
-        self.output_length = output_length
-        self.d_model = d_model
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, L, D = x.shape
-        if L == self.output_length:
-            return x
-        side = int(math.sqrt(L))
-        assert side * side == L, f"Input length {L} is not a perfect square"
-        out_side = int(math.sqrt(self.output_length))
-        assert out_side * out_side == self.output_length
-
-        x = x.view(B, side, side, D)
-        window = side // out_side
-        # Use avg_pool2d
-        x = x.permute(0, 3, 1, 2)  # [B, D, H, W]
-        x = F.avg_pool2d(x, kernel_size=window, stride=window)
-        x = x.permute(0, 2, 3, 1).reshape(B, -1, D)  # [B, output_length, D]
-        return x
-
-
-# ---------------------------------------------------------------------------
-# VisionEncoder (standalone)
+# VisionEncoder (top-level)
 # ---------------------------------------------------------------------------
 
 class VisionEncoder(nn.Module):
-    """Full vision encoder: patches -> blocks -> pool -> project to text space.
+    """Full vision encoder: patches → blocks → pool.
 
-    Owns its projection, so it can be used independently.
+    Does NOT include projection to text space — that is handled by
+    MultimodalEmbedder in model.py.
     """
 
     def __init__(self, cfg: VisionConfig):
         super().__init__()
         self.cfg = cfg
-        self.patch_embed = VisionPatchEmbed(cfg)
-        self.blocks = nn.ModuleList([VisionBlock(cfg) for _ in range(cfg.num_layers)])
-        self.encoder_norm = nn.LayerNorm(cfg.d_model)
-        self.spatial_pool = SpatialPool(cfg.output_length, cfg.d_model)
-        # Projection to text embedding dim
-        self.pre_proj_norm = RMSNorm(cfg.d_model, with_scale=False)
-        self.proj = nn.Linear(cfg.d_model, cfg.text_embed_dim, bias=False)
+        self.patch_embedder = VisionPatchEmbedder(cfg)
+        self.layers = nn.ModuleList([
+            VisionBlock(cfg, layer_idx=i) for i in range(cfg.num_layers)
+        ])
+        self.pooler = VisionPooler(cfg)
 
-    def forward(self, patches: torch.Tensor) -> torch.Tensor:
+        if cfg.standardize:
+            self.register_buffer("std_bias", torch.empty(cfg.d_model))
+            self.register_buffer("std_scale", torch.empty(cfg.d_model))
+
+    def forward(
+            self,
+            pixel_values: torch.Tensor,
+            position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            patches: ``[B, num_patches, patch_dim]`` or ``[B, N, num_patches, patch_dim]``
-                If 4-D, the ``N`` dimension is treated as num_images and is
-                flattened with the batch dim.
+            pixel_values: ``[B, max_patches, patch_dim]`` in [0, 1].
+            position_ids: ``[B, max_patches, 2]`` — (x, y) coords, -1 for padding.
 
         Returns:
-            ``[B, output_length, text_embed_dim]`` (or ``[B, N, output_length, text_embed_dim]``)
+            ``(hidden_states, pooler_mask)`` where hidden_states is the
+            *flat* concatenation of valid tokens across the batch (variable
+            length), and pooler_mask is ``[B, output_length]`` bool.
         """
-        unflatten = False
-        if patches.ndim == 4:
-            B, N, P, C = patches.shape
-            patches = patches.view(B * N, P, C)
-            unflatten = True
+        pooling_kernel_size = self.cfg.pooling_kernel_size
+        output_length = pixel_values.shape[1] // (pooling_kernel_size ** 2)
 
-        x = self.patch_embed(patches)
-        for block in self.blocks:
-            x = block(x)
-        x = self.encoder_norm(x)
-        x = self.spatial_pool(x)
-        x = self.pre_proj_norm(x)
-        x = self.proj(x)
+        padding_mask = (position_ids == -1).all(dim=-1)  # [B, L]
 
-        if unflatten:
-            x = x.view(B, N, *x.shape[1:])
-        return x
+        # Bidirectional attention mask: mask both query and key padding positions.
+        # JAX: attention_mask = input_mask[:, :, None] * input_mask[:, None, :]
+        # Use finfo.min (large finite neg) instead of -inf to avoid NaN from
+        # softmax on all-masked padding rows (JAX uses jnp.finfo(dtype).min).
+        valid = ~padding_mask  # [B, L]
+        attn_mask = valid.unsqueeze(2) & valid.unsqueeze(1)  # [B, L, L]
+        big_neg = torch.finfo(pixel_values.dtype).min
+        attn_mask = torch.where(
+            attn_mask.unsqueeze(1),  # [B, 1, L, L]
+            torch.tensor(0.0, device=pixel_values.device),
+            torch.tensor(big_neg, device=pixel_values.device),
+        )
+
+        x = self.patch_embedder(pixel_values, position_ids, padding_mask)
+
+        for layer in self.layers:
+            x = layer(x, attn_mask, position_ids)
+
+        hidden_states, pooler_mask = self.pooler(x, position_ids, padding_mask, output_length)
+
+        # Strip padding: flatten valid tokens across the batch
+        hidden_states = hidden_states[pooler_mask]
+
+        if self.cfg.standardize:
+            hidden_states = (hidden_states - self.std_bias) * self.std_scale
+
+        return hidden_states, pooler_mask

@@ -21,11 +21,19 @@ from .layers import RMSNorm, GatedMLP, ClippedLinear, apply_rope, apply_multidim
 from .attention import Attention, LayerCache
 from .moe import MoELayer, MoERouter, MoEExperts
 from .transformer import TextDecoder, TransformerBlock, Embedder
-from .vision_encoder import VisionEncoder
+from .vision_encoder import (
+    VisionEncoder,
+    VisionPatchEmbedder,
+    VisionAttention,
+    VisionMLP,
+    VisionBlock,
+    VisionPooler,
+)
 from .audio_encoder import AudioEncoder
+from .image_processing import preprocess_image, preprocess_images
 
 # Top-level model
-from .model import Gemma4Model
+from .model import Gemma4Model, MultimodalEmbedder
 
 # Generation
 from .generate import generate, init_cache, chat
@@ -72,9 +80,18 @@ __all__ = [
     "Embedder",
     # Encoders
     "VisionEncoder",
+    "VisionPatchEmbedder",
+    "VisionAttention",
+    "VisionMLP",
+    "VisionBlock",
+    "VisionPooler",
     "AudioEncoder",
+    # Image processing
+    "preprocess_image",
+    "preprocess_images",
     # Model
     "Gemma4Model",
+    "MultimodalEmbedder",
     # Generation
     "generate",
     "init_cache",

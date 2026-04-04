@@ -91,15 +91,24 @@ class MoEConfig:
 
 @dataclass(frozen=True)
 class VisionConfig:
-    d_model: int = 1152
-    num_layers: int = 27
-    num_heads: int = 16
-    mlp_dim: int = 4304
-    patch_size: int = 14
-    image_size: int = 896
-    output_length: int = 256
+    d_model: int = 768
+    num_layers: int = 16
+    num_heads: int = 12
+    head_dim: int = 64
+    ffw_hidden: int = 3072
+    patch_size: int = 16
+    output_length: int = 280          # soft tokens per image
+    pooling_kernel_size: int = 3
+    position_embedding_size: int = 10240  # max per-dim positions
     use_clipped_linear: bool = False
-    text_embed_dim: int = 2048  # projection target
+    standardize: bool = False
+    rms_norm_eps: float = 1e-6
+    rope_base_frequency: float = 100.0
+    text_embed_dim: int = 1536        # projection target (set per variant)
+
+    @property
+    def max_patches(self) -> int:
+        return self.output_length * self.pooling_kernel_size ** 2
 
 
 @dataclass(frozen=True)

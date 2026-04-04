@@ -40,19 +40,41 @@ _FFW_HIDDEN_RATIO = 4
 _DEFAULT_GLOBAL_KEY_SIZE = 512
 
 
-def _default_vision(
+def _e2b_e4b_vision(
         text_embed_dim: int,
-        use_clipped_linear: bool = True,
 ) -> VisionConfig:
+    """Vision config for E2B/E4B (same encoder, different text_embed_dim)."""
+    return VisionConfig(
+        d_model=768,
+        num_layers=16,
+        num_heads=12,
+        head_dim=64,
+        ffw_hidden=3072,
+        patch_size=16,
+        output_length=280,
+        pooling_kernel_size=3,
+        position_embedding_size=10240,
+        use_clipped_linear=True,
+        text_embed_dim=text_embed_dim,
+    )
+
+
+def _large_vision(
+        text_embed_dim: int,
+) -> VisionConfig:
+    """Vision config for 31B/26B-A4B (SigLiP-So400m-class)."""
     return VisionConfig(
         d_model=1152,
         num_layers=27,
         num_heads=16,
-        mlp_dim=4304,
-        patch_size=14,
-        image_size=896,
-        output_length=256,
-        use_clipped_linear=use_clipped_linear,
+        head_dim=72,
+        ffw_hidden=4304,
+        patch_size=16,
+        output_length=280,
+        pooling_kernel_size=3,
+        position_embedding_size=10240,
+        use_clipped_linear=False,
+        standardize=True,
         text_embed_dim=text_embed_dim,
     )
 
@@ -105,7 +127,7 @@ def gemma4_e2b(text_only: bool = False) -> Gemma4Model:
     )
     cfg = Gemma4Config(
         text=text,
-        vision=None if text_only else _default_vision(embed_dim, use_clipped_linear=True),
+        vision=None if text_only else _e2b_e4b_vision(embed_dim),
         audio=None if text_only else _default_audio(embed_dim),
     )
     return Gemma4Model(cfg)
@@ -148,7 +170,7 @@ def gemma4_e4b(text_only: bool = False) -> Gemma4Model:
     )
     cfg = Gemma4Config(
         text=text,
-        vision=None if text_only else _default_vision(embed_dim, use_clipped_linear=True),
+        vision=None if text_only else _e2b_e4b_vision(embed_dim),
         audio=None if text_only else _default_audio(embed_dim),
     )
     return Gemma4Model(cfg)
@@ -186,17 +208,10 @@ def gemma4_31b(text_only: bool = False) -> Gemma4Model:
         num_global_kv_heads=4,
         global_head_dim=_DEFAULT_GLOBAL_KEY_SIZE,
     )
-    vision = None
-    if not text_only:
-        vision = VisionConfig(
-            d_model=1152,
-            num_layers=27,
-            num_heads=16,
-            mlp_dim=4304,
-            use_clipped_linear=False,
-            text_embed_dim=embed_dim,
-        )
-    cfg = Gemma4Config(text=text, vision=vision)
+    cfg = Gemma4Config(
+        text=text,
+        vision=None if text_only else _large_vision(embed_dim),
+    )
     return Gemma4Model(cfg)
 
 
@@ -238,16 +253,8 @@ def gemma4_26b_a4b(text_only: bool = False) -> Gemma4Model:
             dense_hidden_dim=2112,
         ),
     )
-    vision = None
-    if not text_only:
-        vision = VisionConfig(
-            d_model=1152,
-            num_layers=27,
-            num_heads=16,
-            mlp_dim=4304,
-            output_length=280,
-            use_clipped_linear=False,
-            text_embed_dim=embed_dim,
-        )
-    cfg = Gemma4Config(text=text, vision=vision)
+    cfg = Gemma4Config(
+        text=text,
+        vision=None if text_only else _large_vision(embed_dim),
+    )
     return Gemma4Model(cfg)

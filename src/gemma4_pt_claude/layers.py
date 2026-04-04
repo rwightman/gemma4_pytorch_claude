@@ -158,19 +158,18 @@ class GatedMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ClippedLinear(nn.Module):
-    """Linear layer with four learnable scalar clip bounds (init ±inf)."""
+    """Linear layer with four scalar clip bounds (loaded as buffers, init ±inf)."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
-        # Learnable clip bounds (initialised to ±inf so they are no-ops initially)
-        self.clip_min_pre = nn.Parameter(torch.tensor(float("-inf")))
-        self.clip_max_pre = nn.Parameter(torch.tensor(float("inf")))
-        self.clip_min_post = nn.Parameter(torch.tensor(float("-inf")))
-        self.clip_max_post = nn.Parameter(torch.tensor(float("inf")))
+        self.register_buffer("input_min", torch.tensor(float("-inf")))
+        self.register_buffer("input_max", torch.tensor(float("inf")))
+        self.register_buffer("output_min", torch.tensor(float("-inf")))
+        self.register_buffer("output_max", torch.tensor(float("inf")))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp(x, self.clip_min_pre, self.clip_max_pre)
+        x = torch.clamp(x, self.input_min, self.input_max)
         x = self.linear(x)
-        x = torch.clamp(x, self.clip_min_post, self.clip_max_post)
+        x = torch.clamp(x, self.output_min, self.output_max)
         return x

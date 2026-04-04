@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from .audio_encoder import AudioEncoder
 from .config import Gemma4Config
+from .layers import RMSNorm
 from .transformer import TextDecoder
 from .vision_encoder import VisionEncoder
 
@@ -50,19 +51,33 @@ def merge_multimodal_embeddings(
 
     Args:
         text_embeddings: ``[B, L, D]``
-        mm_embeddings: ``[B, P, D]`` where P is total number of MM tokens
+        mm_embeddings: flat tensor of all valid soft tokens
         placeholder_mask: ``[B, L]`` bool — True at positions to replace
 
     Returns:
         ``[B, L, D]`` with MM embeddings inserted.
     """
-    result = text_embeddings.clone()
-    for b in range(text_embeddings.shape[0]):
-        indices = placeholder_mask[b].nonzero(as_tuple=True)[0]
-        n = min(len(indices), mm_embeddings.shape[1])
-        if n > 0:
-            result[b, indices[:n]] = mm_embeddings[b, :n]
-    return result
+    mask_3d = placeholder_mask.unsqueeze(-1).expand_as(text_embeddings)
+    return text_embeddings.masked_scatter(
+        mask_3d.to(text_embeddings.device),
+        mm_embeddings.to(text_embeddings.device),
+    )
+
+
+# ---------------------------------------------------------------------------
+# MultimodalEmbedder
+# ---------------------------------------------------------------------------
+
+class MultimodalEmbedder(nn.Module):
+    """Project multimodal encoder outputs into text embedding space."""
+
+    def __init__(self, mm_dim: int, text_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.pre_norm = RMSNorm(mm_dim, with_scale=False, eps=eps)
+        self.proj = nn.Linear(mm_dim, text_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(self.pre_norm(x))
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +97,13 @@ class Gemma4Model(nn.Module):
         self.text_decoder = TextDecoder(cfg.text)
 
         self.vision_encoder = None
+        self.embed_vision = None
         if cfg.vision is not None:
             self.vision_encoder = VisionEncoder(cfg.vision)
+            self.embed_vision = MultimodalEmbedder(
+                cfg.vision.d_model, cfg.vision.text_embed_dim,
+                eps=cfg.vision.rms_norm_eps,
+            )
 
         self.audio_encoder = None
         if cfg.audio is not None:
@@ -96,7 +116,8 @@ class Gemma4Model(nn.Module):
             attention_mask: torch.Tensor | None = None,
             cache: dict | None = None,
             # Vision inputs
-            image_patches: torch.Tensor | None = None,
+            pixel_values: torch.Tensor | None = None,
+            image_position_ids: torch.Tensor | None = None,
             image_mask: torch.Tensor | None = None,
             # Audio inputs
             audio_mel: torch.Tensor | None = None,
@@ -108,8 +129,9 @@ class Gemma4Model(nn.Module):
             positions: ``[B, L]`` absolute positions (auto-generated if None)
             attention_mask: ``[B, L, S]`` bool (auto-generated causal if None)
             cache: KV cache dict (optional)
-            image_patches: ``[B, N, P, C]`` or ``[B, P, C]`` — patchified images
-            image_mask: ``[B, L]`` bool — True at image placeholder positions
+            pixel_values: ``[B, max_patches, patch_dim]`` — patchified images
+            image_position_ids: ``[B, max_patches, 2]`` — (x,y) coords (-1 = padding)
+            image_mask: ``[B, L]`` bool — True at image placeholder positions in text
             audio_mel: ``[B, T, F]`` — mel spectrograms
             audio_mel_mask: ``[B, T]`` bool — True for padded frames
 
@@ -140,11 +162,13 @@ class Gemma4Model(nn.Module):
         # --- Embed text tokens ---
         x = self.text_decoder.embedder.encode(tokens)
 
-        # --- Vision: encode + merge ---
-        if image_patches is not None and self.vision_encoder is not None:
-            vision_embeddings = self.vision_encoder(image_patches)
+        # --- Vision: encode + project + merge ---
+        if pixel_values is not None and self.vision_encoder is not None:
+            vision_out, _ = self.vision_encoder(pixel_values, image_position_ids)
+            vision_embeddings = self.embed_vision(vision_out)
+            vision_embeddings = vision_embeddings.to(x.device, x.dtype)
             if image_mask is not None:
-                x = merge_multimodal_embeddings(x, vision_embeddings.view(B, -1, x.shape[-1]), image_mask)
+                x = merge_multimodal_embeddings(x, vision_embeddings, image_mask)
 
         # --- Audio: encode + merge ---
         if audio_mel is not None and self.audio_encoder is not None:
@@ -154,9 +178,16 @@ class Gemma4Model(nn.Module):
             # (placeholder positions would be marked in the token sequence)
 
         # --- Per-layer inputs ---
+        # Replace image placeholder tokens with pad (0) for PLI lookup — image
+        # positions get vision embeddings via the merge above, so PLI should use
+        # the neutral pad embedding at those positions (matches JAX behaviour).
         per_layer_inputs = None
         if self.text_decoder.embedder.per_layer_input_dim > 0:
-            per_layer_inputs = self.text_decoder.embedder.encode_per_layer_input(x, tokens)
+            pli_tokens = tokens
+            if image_mask is not None:
+                pli_tokens = tokens.clone()
+                pli_tokens[image_mask] = 0
+            per_layer_inputs = self.text_decoder.embedder.encode_per_layer_input(x, pli_tokens)
 
         # --- Run text decoder ---
         logits, new_cache = self.text_decoder(
