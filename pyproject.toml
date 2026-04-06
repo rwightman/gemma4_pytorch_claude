@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+audio = ["torchaudio>=2.1"]
 convert = ["jax", "orbax-checkpoint", "numpy"]
 dev = ["pytest", "jax", "flax"]
 

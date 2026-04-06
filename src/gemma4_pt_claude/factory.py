@@ -79,13 +79,12 @@ def _large_vision(
     )
 
 
-def _default_audio(text_embed_dim: int) -> AudioConfig:
+def _default_audio() -> AudioConfig:
     return AudioConfig(
-        hidden_size=1536,
+        hidden_size=1024,
         num_layers=12,
         num_heads=8,
-        text_embed_dim=text_embed_dim,
-        lm_model_dims=text_embed_dim,
+        lm_model_dims=1536,
     )
 
 
@@ -128,7 +127,7 @@ def gemma4_e2b(text_only: bool = False) -> Gemma4Model:
     cfg = Gemma4Config(
         text=text,
         vision=None if text_only else _e2b_e4b_vision(embed_dim),
-        audio=None if text_only else _default_audio(embed_dim),
+        audio=None if text_only else _default_audio(),
     )
     return Gemma4Model(cfg)
 
@@ -171,7 +170,7 @@ def gemma4_e4b(text_only: bool = False) -> Gemma4Model:
     cfg = Gemma4Config(
         text=text,
         vision=None if text_only else _e2b_e4b_vision(embed_dim),
-        audio=None if text_only else _default_audio(embed_dim),
+        audio=None if text_only else _default_audio(),
     )
     return Gemma4Model(cfg)
 

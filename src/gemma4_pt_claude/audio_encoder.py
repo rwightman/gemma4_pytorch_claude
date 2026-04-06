@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import AudioConfig
-from .layers import RMSNorm
+from .layers import ClippedLinear, RMSNorm
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +107,19 @@ class ChunkedLocalAttention(nn.Module):
             cfg.hidden_size, cfg.num_heads, self.head_dim,
             self.max_past, self.max_future,
         )
-        self.per_dim_scale = nn.Parameter(torch.zeros(self.head_dim))
+        self.per_dim_scale = nn.Parameter(torch.ones(self.head_dim))
 
-        self.q_proj = nn.Linear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
+        self.q_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
+        self.k_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
+        self.v_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
 
         # Query scale: rsoftplus(0)/sqrt(H) * softplus(per_dim_scale)
         r_softplus_0 = 1.0 / F.softplus(torch.tensor(0.0)).item()
         self.register_buffer("q_scale_base", torch.tensor(self.head_dim ** -0.5 * r_softplus_0), persistent=False)
+
+        # Key scaling: k *= r_softplus_0 * softplus(1.0)
+        key_scale = r_softplus_0 * F.softplus(torch.tensor(1.0)).item()
+        self.register_buffer("key_scale", torch.tensor(key_scale), persistent=False)
 
         # Local causal mask: [W, C]
         self.register_buffer("local_causal_mask", self._build_causal_mask(), persistent=False)
@@ -193,6 +197,9 @@ class ChunkedLocalAttention(nn.Module):
         pds = F.softplus(self.per_dim_scale)
         q = q * self.q_scale_base * pds
 
+        # Key scaling (matches JAX LocalDotProductAttention)
+        k = k * self.key_scale
+
         q_blocks = self._to_blocks(q)      # [B, U, W, N, H]
         k_ctx = self._extract_context(k)    # [B, U, C, N, H]
         v_ctx = self._extract_context(v)
@@ -232,48 +239,69 @@ class ChunkedLocalAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SubSamplingBlock(nn.Module):
-    """Two Conv2d layers with cumulative group norm + ReLU, then linear project."""
+    """Two Conv2d layers with LayerNorm + ReLU, then linear project.
+
+    JAX uses symmetric ``padding=((1,1),(1,1))`` on both convolutions,
+    equivalent to PyTorch ``padding=1``.
+    """
 
     def __init__(self, cfg: AudioConfig):
         super().__init__()
         c1, c2 = cfg.sscp_channels
         k1, k2 = cfg.sscp_kernel_sizes
         s1, s2 = cfg.sscp_stride_sizes
+        self.stride1 = s1
+        self.stride2 = s2
 
-        self.conv1 = nn.Conv2d(1, c1, kernel_size=k1, stride=s1, padding=0, bias=False)
-        self.conv2 = nn.Conv2d(c1, c2, kernel_size=k2, stride=s2, padding=0, bias=False)
+        # JAX: padding=((1,1),(1,1)) — symmetric on both axes
+        self.conv1 = nn.Conv2d(1, c1, kernel_size=k1, stride=s1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(c1, c2, kernel_size=k2, stride=s2, padding=1, bias=False)
 
         # Calculate output freq dims for norm + linear sizing
+        # With padding=1, kernel=3, stride=2: out = (in + 2*1 - 3)//2 + 1 = (in-1)//2 + 1
         f_in = cfg.input_feat_size
-        # Padding: (pad_f_left, pad_f_right, pad_t_top, pad_t_bottom)
-        self.pad1 = (1, 1, 0, k1[0] - 1)
         f1 = (f_in + 2 - k1[1]) // s1[1] + 1
-        self.pad2 = (1, 1, 0, k2[0] - 1)
         f2 = (f1 + 2 - k2[1]) // s2[1] + 1
 
-        self.norm1 = nn.GroupNorm(1, c1)
-        self.norm2 = nn.GroupNorm(1, c2)
+        # JAX uses nn.LayerNorm(use_bias=False, use_scale=True) on NHWC data.
+        # Our Conv2d outputs NCHW, so we permute to NHWC for norm, then back.
+        self.norm1 = nn.LayerNorm(c1, bias=False)
+        self.norm2 = nn.LayerNorm(c2, bias=False)
 
         self.proj = nn.Linear(c2 * f2, cfg.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _subsample_mask(
+            self, mask: torch.Tensor, stride: tuple[int, int], T_out: int,
+    ) -> torch.Tensor:
+        """Subsample a ``[B, T]`` bool mask along the time axis."""
+        return mask[:, :: stride[0]][:, :T_out]
+
+    def forward(
+            self, x: torch.Tensor, mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: ``[B, T, F]`` — mel spectrogram frames
+            mask: ``[B, T]`` bool — True for *padded* frames
         Returns:
-            ``[B, T', D]`` — subsampled hidden states
+            ``(hidden_states [B, T', D], mask [B, T'])``
         """
         x = x.unsqueeze(1)  # [B, 1, T, F]
 
-        x = F.pad(x, self.pad1)
-        x = F.relu(self.norm1(self.conv1(x)))
+        x = self.conv1(x)  # [B, C1, T1, F1]
+        # LayerNorm on channels: permute NCHW→NHWC, norm, permute back
+        x = self.norm1(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = F.relu(x)
+        mask = self._subsample_mask(mask, self.stride1, x.shape[2])
 
-        x = F.pad(x, self.pad2)
-        x = F.relu(self.norm2(self.conv2(x)))
+        x = self.conv2(x)  # [B, C2, T2, F2]
+        x = self.norm2(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = F.relu(x)
+        mask = self._subsample_mask(mask, self.stride2, x.shape[2])
 
         B, C, T, Freq = x.shape
         x = x.permute(0, 2, 3, 1).reshape(B, T, Freq * C)
-        return self.proj(x)
+        return self.proj(x), mask
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +314,10 @@ class FFNBlock(nn.Module):
     def __init__(self, cfg: AudioConfig):
         super().__init__()
         self.gradient_clip = cfg.gradient_clipping
-        self.pre_norm = RMSNorm(cfg.hidden_size)
-        self.up = nn.Linear(cfg.hidden_size, cfg.hidden_size * 4, bias=False)
-        self.down = nn.Linear(cfg.hidden_size * 4, cfg.hidden_size, bias=False)
-        self.post_norm = RMSNorm(cfg.hidden_size)
+        self.pre_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
+        self.up = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 4, bias=False)
+        self.down = ClippedLinear(cfg.hidden_size * 4, cfg.hidden_size, bias=False)
+        self.post_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
         self.residual_weight = cfg.residual_weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -313,8 +341,8 @@ class LightweightConvBlock(nn.Module):
     def __init__(self, cfg: AudioConfig):
         super().__init__()
         self.gradient_clip = cfg.gradient_clipping
-        self.pre_norm = RMSNorm(cfg.hidden_size)
-        self.linear_start = nn.Linear(cfg.hidden_size, cfg.hidden_size * 2, bias=False)
+        self.pre_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
+        self.linear_start = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 2, bias=False)
         self.dwconv = nn.Conv1d(
             cfg.hidden_size, cfg.hidden_size,
             kernel_size=cfg.conv_kernel_size,
@@ -322,8 +350,8 @@ class LightweightConvBlock(nn.Module):
             groups=cfg.hidden_size, bias=False,
         )
         self.causal_pad = cfg.conv_kernel_size - 1
-        self.conv_norm = RMSNorm(cfg.hidden_size)
-        self.linear_end = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
+        self.conv_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
+        self.linear_end = ClippedLinear(cfg.hidden_size, cfg.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -350,10 +378,10 @@ class ConformerAttention(nn.Module):
     def __init__(self, cfg: AudioConfig):
         super().__init__()
         self.gradient_clip = cfg.gradient_clipping
-        self.pre_norm = RMSNorm(cfg.hidden_size)
+        self.pre_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
         self.attn = ChunkedLocalAttention(cfg)
-        self.o_proj = nn.Linear(cfg.hidden_size, cfg.hidden_size, bias=False)
-        self.post_norm = RMSNorm(cfg.hidden_size)
+        self.o_proj = ClippedLinear(cfg.hidden_size, cfg.hidden_size, bias=False)
+        self.post_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -381,7 +409,7 @@ class ConformerLayer(nn.Module):
         self.lconv = LightweightConvBlock(cfg)
         self.ffw_end = FFNBlock(cfg)
         self.gradient_clip = cfg.gradient_clipping
-        self.norm = RMSNorm(cfg.hidden_size)
+        self.norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         x = self.ffw_start(x)
@@ -400,9 +428,10 @@ class ConformerLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class AudioEncoder(nn.Module):
-    """Full audio encoder: mel -> subsample -> conformer -> project to text space.
+    """Full audio encoder: mel -> subsample -> conformer -> output projection.
 
-    Owns its projection to text embedding space, so it can be used independently.
+    Projection from ``lm_model_dims`` to text embedding space lives in
+    the model-level ``embed_audio`` (MultimodalEmbedder), not here.
     """
 
     def __init__(self, cfg: AudioConfig):
@@ -410,34 +439,28 @@ class AudioEncoder(nn.Module):
         self.cfg = cfg
         self.subsample = SubSamplingBlock(cfg)
         self.conformer = nn.ModuleList([ConformerLayer(cfg) for _ in range(cfg.num_layers)])
-        self.output_proj = nn.Linear(cfg.hidden_size, cfg.lm_model_dims, bias=False)
-        self.audio_proj = nn.Linear(cfg.lm_model_dims, cfg.text_embed_dim, bias=False)
-        self.audio_norm = RMSNorm(cfg.text_embed_dim, with_scale=False)
+        self.output_proj = nn.Linear(cfg.hidden_size, cfg.lm_model_dims, bias=True)
 
     def forward(
             self, mel: torch.Tensor, mel_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             mel: ``[B, T, F]`` — mel spectrogram frames
             mel_mask: ``[B, T]`` bool — True for padded frames
 
         Returns:
-            ``[B, T', text_embed_dim]``
+            ``(embeddings [B, T', lm_model_dims], mask [B, T'])``
         """
-        x = self.subsample(mel)  # [B, T', D]
-
-        # Subsample the mask to match
-        T_sub = x.shape[1]
-        if mel_mask.shape[1] != T_sub:
-            # Simple subsampling: take every reduction_factor-th mask value
-            factor = mel_mask.shape[1] // T_sub if T_sub > 0 else 1
-            mel_mask = mel_mask[:, ::factor][:, :T_sub]
+        x, mel_mask = self.subsample(mel, mel_mask)  # [B, T', D]
 
         for layer in self.conformer:
             x = layer(x, mel_mask)
 
         x = self.output_proj(x)
-        x = self.audio_proj(x)
-        x = self.audio_norm(x)
-        return x
+
+        # Zero-out padded positions
+        valid = (~mel_mask).unsqueeze(-1).to(x.dtype)
+        x = x * valid
+
+        return x, mel_mask

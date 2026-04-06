@@ -23,6 +23,7 @@ class LayerCache(TypedDict):
     v: torch.Tensor       # [B, cache_len, kv_heads, head_dim]
     positions: torch.Tensor  # [B, cache_len]
     end_index: torch.Tensor  # [B]
+    valid_mask: torch.Tensor  # [B, cache_len] bool — True for filled slots
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +123,7 @@ class Attention(nn.Module):
             v=torch.zeros(shape, dtype=dtype, device=device),
             positions=torch.zeros(batch_size, cache_length, dtype=torch.int32, device=device),
             end_index=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            valid_mask=torch.zeros(batch_size, cache_length, dtype=torch.bool, device=device),
         )
 
     # ---- forward ---------------------------------------------------------
@@ -174,19 +176,33 @@ class Attention(nn.Module):
 
         # --- KV cache update ---
         cache_positions = None
+        valid_mask = None
         if shared_kv_cache is not None:
             # Reuse positions from the layer we're sharing KV with
             cache_positions = shared_kv_cache.get("positions")
+            valid_mask = shared_kv_cache.get("valid_mask")
         elif cache is not None:
+            # All batch elements must have the same end_index (single-batch
+            # decode or uniform-length batched decode). Assert to catch misuse.
             end = cache["end_index"][0].item()
+            assert (cache["end_index"] == end).all(), (
+                "Heterogeneous batch end_index not supported; all batch "
+                "elements must have the same cache fill level"
+            )
             cache_len = cache["v"].shape[1]
             idx = end % cache_len
             cache["k"][:, idx : idx + L] = k.to(cache["k"].dtype)
             cache["v"][:, idx : idx + L] = v.to(cache["v"].dtype)
             cache["positions"][:, idx : idx + L] = positions
+            cache["valid_mask"][:, idx : idx + L] = True
             k = cache["k"].to(q.dtype)
             v = cache["v"].to(q.dtype)
             cache_positions = cache["positions"]
+            valid_mask = cache["valid_mask"]
+
+        # --- Mask out unfilled cache slots ---
+        if valid_mask is not None:
+            attn_mask = attn_mask & valid_mask[:, None, :]  # [B, 1, S] broadcast over L
 
         # --- Sliding window mask ---
         if self.attn_type == AttentionType.LOCAL_SLIDING:
@@ -222,6 +238,7 @@ class Attention(nn.Module):
                 "v": cache["v"] if shared_kv_cache is None else cache["v"],
                 "end_index": cache["end_index"] + L,
                 "positions": cache_positions if cache_positions is not None else cache["positions"],
+                "valid_mask": cache["valid_mask"],
             }
         elif shared_kv_cache is None:
             # Still return layer-sharing KV (vertical sharing)
@@ -301,9 +318,9 @@ class Attention(nn.Module):
         if self.attn_logits_soft_cap is not None:
             logits = torch.tanh(logits / self.attn_logits_soft_cap) * self.attn_logits_soft_cap
 
-        # Masked softmax
+        # Masked softmax (float32 for numerical stability in bf16)
         padded = torch.where(attn_mask.unsqueeze(-2), logits, K_MASK)
-        probs = F.softmax(padded, dim=-1).to(k.dtype)
+        probs = F.softmax(padded.float(), dim=-1).to(k.dtype)
 
         # Weighted sum
         if self.groups > 1:

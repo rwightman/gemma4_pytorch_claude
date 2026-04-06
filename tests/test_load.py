@@ -9,7 +9,13 @@ from safetensors.torch import save_file
 
 from gemma4_pt_claude.config import AttentionType, Gemma4Config, TextConfig
 from gemma4_pt_claude.model import Gemma4Model
-from gemma4_pt_claude.load import load_weights, _hf_key_to_ours, _hf_convert_weights
+from gemma4_pt_claude.load import (
+    load_weights,
+    _hf_key_to_ours,
+    _hf_convert_weights,
+    _hf_vision_key_to_ours,
+    _hf_audio_key_to_ours,
+)
 
 
 class TestHFKeyMapping:
@@ -159,3 +165,96 @@ class TestLoadWeights:
             save_file(state, str(path))
             missing, unexpected = load_weights(tiny_model, path, format="auto")
             assert missing == []
+
+
+class TestVisionKeyMapping:
+    def test_patch_embedder(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.patch_embedder.input_proj.weight"
+        ) == "vision_encoder.patch_embedder.input_proj.weight"
+
+    def test_position_embedding_table(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.patch_embedder.position_embedding_table"
+        ) == "vision_encoder.patch_embedder.position_embedding_table"
+
+    def test_encoder_layer_attn(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight"
+        ) == "vision_encoder.layers.0.attn.q_proj.linear.weight"
+
+    def test_encoder_layer_norm(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.layers.5.input_layernorm.weight"
+        ) == "vision_encoder.layers.5.pre_attn_norm.scale"
+
+    def test_encoder_layer_mlp(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight"
+        ) == "vision_encoder.layers.0.mlp.gate_proj.linear.weight"
+
+    def test_rotary_emb_skipped(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.rotary_emb.inv_freq"
+        ) is None
+
+    def test_qk_norm(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.layers.0.self_attn.q_norm.weight"
+        ) == "vision_encoder.layers.0.attn.q_norm.scale"
+
+
+class TestAudioKeyMapping:
+    def test_subsample(self):
+        assert _hf_audio_key_to_ours(
+            "audio_tower.subsampling.conv1.weight"
+        ) == "audio_encoder.subsample.conv1.weight"
+
+    def test_current_hf_subsample(self):
+        assert _hf_audio_key_to_ours(
+            "audio_tower.subsample_conv_projection.layer0.conv.weight"
+        ) == "audio_encoder.subsample.conv1.weight"
+
+    def test_subsample_norm(self):
+        # LayerNorm: weight only, no bias
+        assert _hf_audio_key_to_ours(
+            "audio_tower.subsampling.norm1.weight"
+        ) == "audio_encoder.subsample.norm1.weight"
+
+    def test_output_proj_weight(self):
+        assert _hf_audio_key_to_ours(
+            "audio_tower.output_proj.weight"
+        ) == "audio_encoder.output_proj.weight"
+
+    def test_output_proj_bias(self):
+        assert _hf_audio_key_to_ours(
+            "audio_tower.output_proj.bias"
+        ) == "audio_encoder.output_proj.bias"
+
+    def test_non_audio_returns_none(self):
+        assert _hf_audio_key_to_ours("vision_tower.something") is None
+
+    def test_conformer_layer(self):
+        result = _hf_audio_key_to_ours(
+            "audio_tower.conformer.layers.0.ffw_start.up.linear.weight"
+        )
+        assert result == "audio_encoder.conformer.0.ffw_start.up.linear.weight"
+
+    def test_current_hf_conformer_layer(self):
+        result = _hf_audio_key_to_ours(
+            "audio_tower.layers.0.feed_forward1.ffw_layer_1.linear.weight"
+        )
+        assert result == "audio_encoder.conformer.0.ffw_start.up.linear.weight"
+
+    def test_current_hf_relative_position(self):
+        result = _hf_audio_key_to_ours(
+            "audio_tower.layers.0.self_attn.relative_k_proj.weight"
+        )
+        assert result == "audio_encoder.conformer.0.attn.attn.rel_pos_emb.pos_proj.weight"
+
+    def test_audio_embedder_key(self):
+        result = _hf_key_to_ours(
+            "model.embed_audio.embedding_projection.weight", 4,
+            has_audio=True,
+        )
+        assert result == "embed_audio.proj.weight"

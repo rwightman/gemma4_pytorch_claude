@@ -4,7 +4,14 @@ import torch
 import pytest
 
 from gemma4_pt_claude.config import AttentionType, Gemma4Config, TextConfig
-from gemma4_pt_claude.model import Gemma4Model, make_causal_mask, make_causal_mask_with_cache
+from gemma4_pt_claude.model import (
+    Gemma4Model,
+    build_audio_token_mask,
+    flatten_multimodal_tokens,
+    make_causal_mask,
+    make_causal_mask_with_cache,
+    make_causal_bidirectional_mask,
+)
 from gemma4_pt_claude.generate import generate, init_cache
 
 
@@ -38,15 +45,32 @@ class TestCausalMask:
         assert mask[0, 0, 1].item() is False
         assert mask[0, 3, 0].item() is True
 
-    def test_cache_mask_prefill(self):
-        mask = make_causal_mask_with_cache(4, 8, torch.device("cpu"))
+    def test_cache_mask_prefill_from_empty(self):
+        # Prefill 4 tokens into an 8-slot cache starting empty (offset=0)
+        mask = make_causal_mask_with_cache(4, 8, 0, torch.device("cpu"))
         assert mask.shape == (1, 4, 8)
+        # Should be causal in first 4 columns, all-True in remaining
+        # (valid_mask in attention handles the unfilled slots)
+        assert mask[0, 0, 0].item() is True
+        assert mask[0, 0, 1].item() is False  # row 0 can't see future
+        assert mask[0, 3, 3].item() is True
+        assert mask[0, 3, 4].item() is False   # no diagonal shift
+
+    def test_cache_mask_prefill_with_offset(self):
+        # 4 tokens into 8-slot cache with 2 previous entries (offset=2)
+        mask = make_causal_mask_with_cache(4, 8, 2, torch.device("cpu"))
+        assert mask.shape == (1, 4, 8)
+        # Row 0: columns 0,1 (prev) + column 2 (self) = True; column 3+ = False
+        assert mask[0, 0, 1].item() is True   # previous entry
+        assert mask[0, 0, 2].item() is True   # self (first new token)
+        assert mask[0, 0, 3].item() is False  # future new token
 
     def test_cache_mask_single_token(self):
-        mask = make_causal_mask_with_cache(1, 8, torch.device("cpu"))
+        mask = make_causal_mask_with_cache(1, 8, 5, torch.device("cpu"))
         assert mask.shape == (1, 1, 8)
-        # Single token decode: all cache positions visible
-        assert mask.all()
+        # Single token at offset 5: can see columns 0..5
+        assert mask[0, 0, 5].item() is True
+        assert mask[0, 0, 6].item() is False
 
 
 class TestGemma4Model:
@@ -75,6 +99,42 @@ class TestGemma4Model:
         assert model.audio_encoder is None
 
 
+class TestCacheValidMask:
+    def test_valid_mask_after_prefill(self):
+        cfg = _tiny_config()
+        model = Gemma4Model(cfg)
+        B, L = 1, 4
+        cache = init_cache(cfg, B, 16)
+
+        tokens = torch.randint(0, 64, (B, L))
+        _, new_cache = model(tokens, cache=cache)
+
+        first_layer = new_cache["layer_0"]
+        # First L positions should be valid
+        assert first_layer["valid_mask"][:, :L].all()
+        # Rest should be invalid
+        assert not first_layer["valid_mask"][:, L:].any()
+
+    def test_valid_mask_after_decode_step(self):
+        cfg = _tiny_config()
+        model = Gemma4Model(cfg)
+        B, L = 1, 4
+        cache = init_cache(cfg, B, 16)
+
+        # Prefill
+        tokens = torch.randint(0, 64, (B, L))
+        _, cache = model(tokens, cache=cache)
+
+        # Decode 1 token
+        next_tok = torch.randint(0, 64, (B, 1))
+        _, cache = model(next_tok, cache=cache)
+
+        first_layer = cache["layer_0"]
+        # First L+1 positions should be valid
+        assert first_layer["valid_mask"][:, :L + 1].all()
+        assert not first_layer["valid_mask"][:, L + 1:].any()
+
+
 class TestGenerate:
     def test_generate_length(self):
         cfg = _tiny_config()
@@ -94,3 +154,39 @@ class TestGenerate:
         out1 = generate(model, tokens, max_new_tokens=4, temperature=0.0)
         out2 = generate(model, tokens, max_new_tokens=4, temperature=0.0)
         assert torch.equal(out1, out2)
+
+
+class TestAudioHelpers:
+    def test_build_audio_token_mask_caps_tokens(self):
+        counts = torch.tensor([3, 1], dtype=torch.long)
+        mask = build_audio_token_mask(counts, total_audio_tokens=5)
+        expected = torch.tensor(
+            [
+                [True, True, True, False, False],
+                [True, False, False, False, False],
+            ],
+            dtype=torch.bool,
+        )
+        assert torch.equal(mask, expected)
+
+    def test_flatten_multimodal_tokens_single_prompt(self):
+        mm_embeddings = torch.tensor(
+            [
+                [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]],
+                [[4.0, 4.0], [5.0, 5.0], [6.0, 6.0]],
+            ]
+        )
+        mm_mask = torch.tensor(
+            [
+                [True, False, True],
+                [False, True, False],
+            ],
+            dtype=torch.bool,
+        )
+
+        flat_embeddings, flat_mask = flatten_multimodal_tokens(mm_embeddings, mm_mask)
+
+        expected_embeddings = torch.tensor([[[1.0, 1.0], [3.0, 3.0], [5.0, 5.0]]])
+        expected_mask = torch.tensor([[True, True, True]], dtype=torch.bool)
+        assert torch.equal(flat_embeddings, expected_embeddings)
+        assert torch.equal(flat_mask, expected_mask)

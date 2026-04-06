@@ -79,6 +79,8 @@ def generate(
         image_mask: torch.Tensor | None = None,
         audio_mel: torch.Tensor | None = None,
         audio_mel_mask: torch.Tensor | None = None,
+        audio_mask: torch.Tensor | None = None,
+        audio_num_soft_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Autoregressive generation with KV cache.
 
@@ -106,7 +108,8 @@ def generate(
         cache_length = L + max_new_tokens
 
     # --- Initialise cache ---
-    cache = init_cache(cfg, B, cache_length, dtype=torch.bfloat16, device=device)
+    cache_dtype = next(model.parameters()).dtype
+    cache = init_cache(cfg, B, cache_length, dtype=cache_dtype, device=device)
 
     # --- Prefill phase ---
     logits, cache = model(
@@ -117,6 +120,8 @@ def generate(
         image_mask=image_mask,
         audio_mel=audio_mel,
         audio_mel_mask=audio_mel_mask,
+        audio_mask=audio_mask,
+        audio_num_soft_tokens=audio_num_soft_tokens,
     )
 
     # Take logits of last position
@@ -182,7 +187,9 @@ def chat(
     # Build chat-formatted token sequence
     ids: list[int] = [tokenizer.BOS, tokenizer.START_OF_TURN]
     ids += tokenizer.encode("user\n" + prompt)
-    ids += [tokenizer.END_OF_TURN, tokenizer.START_OF_TURN]
+    ids += [tokenizer.END_OF_TURN]
+    ids += tokenizer.encode("\n")
+    ids += [tokenizer.START_OF_TURN]
     ids += tokenizer.encode("model\n")
 
     prompt_len = len(ids)

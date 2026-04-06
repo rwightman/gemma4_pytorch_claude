@@ -31,9 +31,18 @@ from .vision_encoder import (
 )
 from .audio_encoder import AudioEncoder
 from .image_processing import preprocess_image, preprocess_images
+from .audio_processing import preprocess_audio, extract_mel_spectrogram
+from .composer import (
+    Composer,
+    ComposedInput,
+    ImageTransform,
+    PreparedImage,
+    AudioTransform,
+    PreparedAudio,
+)
 
 # Top-level model
-from .model import Gemma4Model, MultimodalEmbedder
+from .model import Gemma4Model, VisionEmbedder, AudioEmbedder
 
 # Generation
 from .generate import generate, init_cache, chat
@@ -89,9 +98,20 @@ __all__ = [
     # Image processing
     "preprocess_image",
     "preprocess_images",
+    # Audio processing
+    "preprocess_audio",
+    "extract_mel_spectrogram",
+    # Composer
+    "Composer",
+    "ComposedInput",
+    "ImageTransform",
+    "PreparedImage",
+    "AudioTransform",
+    "PreparedAudio",
     # Model
     "Gemma4Model",
-    "MultimodalEmbedder",
+    "VisionEmbedder",
+    "AudioEmbedder",
     # Generation
     "generate",
     "init_cache",

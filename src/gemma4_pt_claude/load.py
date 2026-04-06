@@ -28,7 +28,12 @@ from .model import Gemma4Model
 # HuggingFace → our naming
 # ---------------------------------------------------------------------------
 
-def _hf_key_to_ours(hf_key: str, num_layers: int, has_vision: bool = False) -> str | None:
+def _hf_key_to_ours(
+        hf_key: str,
+        num_layers: int,
+        has_vision: bool = False,
+        has_audio: bool = False,
+) -> str | None:
     """Map a single HF key to our naming convention.
 
     Returns None if the key should be skipped.
@@ -126,14 +131,173 @@ def _hf_key_to_ours(hf_key: str, num_layers: int, has_vision: bool = False) -> s
         if rest in _pli_map:
             return f"{prefix}.{_pli_map[rest]}"
 
+    # --- Multimodal embedder (audio) ---
+    if has_audio:
+        if k == "embed_audio.embedding_projection.weight":
+            return "embed_audio.proj.weight"
+        if k == "embed_audio.embedding_pre_projection_norm.weight":
+            return None  # with_scale=False → no weight parameter
+
+    # --- Audio tower ---
+    if k.startswith("audio_tower.") and has_audio:
+        return _hf_audio_key_to_ours(k)
+
+    return None
+
+
+def _hf_audio_key_to_ours(k: str) -> str | None:
+    """Map a single HF audio_tower key to our naming."""
+    # audio_tower.{submodule}.{rest} → audio_encoder.{mapped_submodule}.{rest}
+    if not k.startswith("audio_tower."):
+        return None
+
+    rest = k[len("audio_tower."):]
+
+    # Legacy subsample block naming.
+    legacy_sub_map = {
+        "subsampling.conv1.weight": "audio_encoder.subsample.conv1.weight",
+        "subsampling.conv2.weight": "audio_encoder.subsample.conv2.weight",
+        "subsampling.norm1.weight": "audio_encoder.subsample.norm1.weight",
+        "subsampling.norm2.weight": "audio_encoder.subsample.norm2.weight",
+        "subsampling.proj.weight": "audio_encoder.subsample.proj.weight",
+    }
+    if rest in legacy_sub_map:
+        return legacy_sub_map[rest]
+
+    # Current HF subsampling naming.
+    subsample_map = {
+        "subsample_conv_projection.layer0.conv.weight": "audio_encoder.subsample.conv1.weight",
+        "subsample_conv_projection.layer1.conv.weight": "audio_encoder.subsample.conv2.weight",
+        "subsample_conv_projection.layer0.norm.weight": "audio_encoder.subsample.norm1.weight",
+        "subsample_conv_projection.layer1.norm.weight": "audio_encoder.subsample.norm2.weight",
+        "subsample_conv_projection.input_proj_linear.weight": "audio_encoder.subsample.proj.weight",
+    }
+    if rest in subsample_map:
+        return subsample_map[rest]
+
+    # Legacy conformer-layer naming.
+    if rest.startswith("conformer.layers."):
+        parts = rest.split(".", 3)  # ["conformer", "layers", "N", "rest"]
+        if len(parts) < 4:
+            return None
+        layer_idx = parts[2]
+        layer_rest = parts[3]
+        prefix = f"audio_encoder.conformer.{layer_idx}"
+
+        # Suffix passthrough for ClippedLinear subkeys (legacy naming)
+        for legacy_name, our_name in [
+            # FFN start
+            ("ffw_start.up.", f"{prefix}.ffw_start.up."),
+            ("ffw_start.down.", f"{prefix}.ffw_start.down."),
+            # Attention
+            ("attn.attn.q_proj.", f"{prefix}.attn.attn.q_proj."),
+            ("attn.attn.k_proj.", f"{prefix}.attn.attn.k_proj."),
+            ("attn.attn.v_proj.", f"{prefix}.attn.attn.v_proj."),
+            ("attn.o_proj.", f"{prefix}.attn.o_proj."),
+            # Lightweight conv
+            ("lconv.linear_start.", f"{prefix}.lconv.linear_start."),
+            ("lconv.linear_end.", f"{prefix}.lconv.linear_end."),
+            # FFN end
+            ("ffw_end.up.", f"{prefix}.ffw_end.up."),
+            ("ffw_end.down.", f"{prefix}.ffw_end.down."),
+        ]:
+            if layer_rest.startswith(legacy_name):
+                suffix = layer_rest[len(legacy_name):]
+                return f"{our_name}{suffix}"
+
+        # Exact-match keys (norms, per_dim_scale, pos_proj, dwconv)
+        _conformer_exact = {
+            "ffw_start.pre_norm.scale": f"{prefix}.ffw_start.pre_norm.scale",
+            "ffw_start.post_norm.scale": f"{prefix}.ffw_start.post_norm.scale",
+            "attn.pre_norm.scale": f"{prefix}.attn.pre_norm.scale",
+            "attn.attn.per_dim_scale": f"{prefix}.attn.attn.per_dim_scale",
+            "attn.attn.rel_pos_emb.pos_proj.weight": f"{prefix}.attn.attn.rel_pos_emb.pos_proj.weight",
+            "attn.post_norm.scale": f"{prefix}.attn.post_norm.scale",
+            "lconv.pre_norm.scale": f"{prefix}.lconv.pre_norm.scale",
+            "lconv.dwconv.weight": f"{prefix}.lconv.dwconv.weight",
+            "lconv.conv_norm.scale": f"{prefix}.lconv.conv_norm.scale",
+            "ffw_end.pre_norm.scale": f"{prefix}.ffw_end.pre_norm.scale",
+            "ffw_end.post_norm.scale": f"{prefix}.ffw_end.post_norm.scale",
+            "norm.scale": f"{prefix}.norm.scale",
+        }
+        if layer_rest in _conformer_exact:
+            return _conformer_exact[layer_rest]
+
+    # Current HF layer naming.
+    if rest.startswith("layers."):
+        parts = rest.split(".", 2)  # ["layers", "N", "rest"]
+        if len(parts) < 3:
+            return None
+        layer_idx = parts[1]
+        layer_rest = parts[2]
+        prefix = f"audio_encoder.conformer.{layer_idx}"
+
+        # Attention projections — suffix passthrough for ClippedLinear subkeys
+        for hf_name, our_name in [
+            ("self_attn.q_proj.", f"{prefix}.attn.attn.q_proj."),
+            ("self_attn.k_proj.", f"{prefix}.attn.attn.k_proj."),
+            ("self_attn.v_proj.", f"{prefix}.attn.attn.v_proj."),
+            ("self_attn.post.", f"{prefix}.attn.o_proj."),
+        ]:
+            if layer_rest.startswith(hf_name):
+                suffix = layer_rest[len(hf_name):]
+                return f"{our_name}{suffix}"
+
+        # FFN — suffix passthrough
+        for hf_name, our_name in [
+            ("feed_forward1.ffw_layer_1.", f"{prefix}.ffw_start.up."),
+            ("feed_forward1.ffw_layer_2.", f"{prefix}.ffw_start.down."),
+            ("feed_forward2.ffw_layer_1.", f"{prefix}.ffw_end.up."),
+            ("feed_forward2.ffw_layer_2.", f"{prefix}.ffw_end.down."),
+        ]:
+            if layer_rest.startswith(hf_name):
+                suffix = layer_rest[len(hf_name):]
+                return f"{our_name}{suffix}"
+
+        # Lightweight conv — suffix passthrough
+        for hf_name, our_name in [
+            ("lconv1d.linear_start.", f"{prefix}.lconv.linear_start."),
+            ("lconv1d.linear_end.", f"{prefix}.lconv.linear_end."),
+        ]:
+            if layer_rest.startswith(hf_name):
+                suffix = layer_rest[len(hf_name):]
+                return f"{our_name}{suffix}"
+
+        # Exact-match keys (norms, per_dim_scale, pos_proj, dwconv)
+        conformer_exact = {
+            "feed_forward1.pre_layer_norm.weight": f"{prefix}.ffw_start.pre_norm.scale",
+            "feed_forward1.post_layer_norm.weight": f"{prefix}.ffw_start.post_norm.scale",
+            "norm_pre_attn.weight": f"{prefix}.attn.pre_norm.scale",
+            "self_attn.per_dim_scale": f"{prefix}.attn.attn.per_dim_scale",
+            "self_attn.relative_k_proj.weight": f"{prefix}.attn.attn.rel_pos_emb.pos_proj.weight",
+            "norm_post_attn.weight": f"{prefix}.attn.post_norm.scale",
+            "lconv1d.pre_layer_norm.weight": f"{prefix}.lconv.pre_norm.scale",
+            "lconv1d.depthwise_conv1d.weight": f"{prefix}.lconv.dwconv.weight",
+            "lconv1d.conv_norm.weight": f"{prefix}.lconv.conv_norm.scale",
+            "feed_forward2.pre_layer_norm.weight": f"{prefix}.ffw_end.pre_norm.scale",
+            "feed_forward2.post_layer_norm.weight": f"{prefix}.ffw_end.post_norm.scale",
+            "norm_out.weight": f"{prefix}.norm.scale",
+        }
+        if layer_rest in conformer_exact:
+            return conformer_exact[layer_rest]
+
+    # Output projection (with bias)
+    _proj_map = {
+        "output_proj.weight": "audio_encoder.output_proj.weight",
+        "output_proj.bias": "audio_encoder.output_proj.bias",
+    }
+    if rest in _proj_map:
+        return _proj_map[rest]
+
     return None
 
 
 def _hf_vision_key_to_ours(k: str) -> str | None:
     """Map a single HF vision_tower key (prefix already stripped to ``vision_tower.``)."""
     # --- Patch embedder ---
-    if k == "vision_tower.patch_embedder.input_proj.weight":
-        return "vision_encoder.patch_embedder.input_proj.weight"
+    if k.startswith("vision_tower.patch_embedder.input_proj."):
+        suffix = k[len("vision_tower.patch_embedder.input_proj."):]
+        return f"vision_encoder.patch_embedder.input_proj.{suffix}"
     if k == "vision_tower.patch_embedder.position_embedding_table":
         return "vision_encoder.patch_embedder.position_embedding_table"
 
@@ -190,6 +354,7 @@ def _hf_convert_weights(
         raw: dict[str, torch.Tensor],
         num_layers: int,
         has_vision: bool = False,
+        has_audio: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Convert HF safetensors keys to our naming, merging gate/up projections."""
     mapped: dict[str, torch.Tensor] = {}
@@ -217,7 +382,7 @@ def _hf_convert_weights(
             up_projs[layer_idx] = tensor
             continue
 
-        our_key = _hf_key_to_ours(hf_key, num_layers, has_vision=has_vision)
+        our_key = _hf_key_to_ours(hf_key, num_layers, has_vision=has_vision, has_audio=has_audio)
         if our_key is not None:
             mapped[our_key] = tensor
         else:
@@ -298,7 +463,8 @@ def load_weights(
     if format == "hf":
         num_layers = model.cfg.text.num_layers
         has_vision = model.vision_encoder is not None
-        raw = _hf_convert_weights(raw, num_layers, has_vision=has_vision)
+        has_audio = model.audio_encoder is not None
+        raw = _hf_convert_weights(raw, num_layers, has_vision=has_vision, has_audio=has_audio)
 
     # Optional dtype cast
     if dtype is not None:

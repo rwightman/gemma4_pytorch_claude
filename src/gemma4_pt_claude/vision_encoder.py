@@ -39,9 +39,11 @@ class VisionPatchEmbedder(nn.Module):
         super().__init__()
         self.cfg = cfg
         patch_dim = 3 * cfg.patch_size ** 2
+        # JAX uses plain Einsum (not ClippedEinsum) for input_projection
+        # across all model sizes, so always use nn.Linear here.
         self.input_proj = nn.Linear(patch_dim, cfg.d_model, bias=False)
         self.position_embedding_table = nn.Parameter(
-            torch.ones(2, cfg.position_embedding_size, cfg.d_model),
+            torch.zeros(2, cfg.position_embedding_size, cfg.d_model),
         )
 
     def _position_embeddings(
@@ -78,7 +80,8 @@ class VisionPatchEmbedder(nn.Module):
             padding_mask: ``[B, L]`` True for padding patches.
         """
         pixel_values = 2.0 * (pixel_values - 0.5)
-        hidden = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
+        proj_dtype = next(self.input_proj.parameters()).dtype
+        hidden = self.input_proj(pixel_values.to(proj_dtype))
         pos_emb = self._position_embeddings(position_ids, padding_mask)
         return hidden + pos_emb
 
@@ -292,8 +295,8 @@ class VisionEncoder(nn.Module):
         self.pooler = VisionPooler(cfg)
 
         if cfg.standardize:
-            self.register_buffer("std_bias", torch.empty(cfg.d_model))
-            self.register_buffer("std_scale", torch.empty(cfg.d_model))
+            self.register_buffer("std_bias", torch.zeros(cfg.d_model))
+            self.register_buffer("std_scale", torch.ones(cfg.d_model))
 
     def forward(
             self,
@@ -306,9 +309,9 @@ class VisionEncoder(nn.Module):
             position_ids: ``[B, max_patches, 2]`` — (x, y) coords, -1 for padding.
 
         Returns:
-            ``(hidden_states, pooler_mask)`` where hidden_states is the
-            *flat* concatenation of valid tokens across the batch (variable
-            length), and pooler_mask is ``[B, output_length]`` bool.
+            ``(hidden_states, pooler_mask)`` where hidden_states is
+            ``[B, output_length, D]`` and pooler_mask is ``[B, output_length]``
+            bool (True = valid soft token).
         """
         pooling_kernel_size = self.cfg.pooling_kernel_size
         output_length = pixel_values.shape[1] // (pooling_kernel_size ** 2)
@@ -334,9 +337,6 @@ class VisionEncoder(nn.Module):
             x = layer(x, attn_mask, position_ids)
 
         hidden_states, pooler_mask = self.pooler(x, position_ids, padding_mask, output_length)
-
-        # Strip padding: flatten valid tokens across the batch
-        hidden_states = hidden_states[pooler_mask]
 
         if self.cfg.standardize:
             hidden_states = (hidden_states - self.std_bias) * self.std_scale

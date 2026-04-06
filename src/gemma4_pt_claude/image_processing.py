@@ -150,7 +150,9 @@ def preprocess_image(
             __import__("numpy").array(image)
         ).permute(2, 0, 1).float() / 255.0
     elif isinstance(image, torch.Tensor):
-        if image.dtype != torch.float32:
+        if image.dtype == torch.uint8:
+            image = image.float() / 255.0
+        elif image.dtype != torch.float32:
             image = image.float()
     else:
         raise TypeError(f"Expected PIL Image or torch.Tensor, got {type(image)}")

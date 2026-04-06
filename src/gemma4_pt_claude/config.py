@@ -113,7 +113,7 @@ class VisionConfig:
 
 @dataclass(frozen=True)
 class AudioConfig:
-    hidden_size: int = 1536
+    hidden_size: int = 1024
     num_layers: int = 12
     num_heads: int = 8
     chunk_size: int = 12
@@ -128,8 +128,7 @@ class AudioConfig:
     sscp_kernel_sizes: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_stride_sizes: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
     sscp_group_norm_eps: float = 1e-3
-    text_embed_dim: int = 2048  # projection target
-    lm_model_dims: int = 2048  # intermediate proj dim (can differ from text_embed_dim)
+    lm_model_dims: int = 1536
 
 
 # ---------------------------------------------------------------------------
