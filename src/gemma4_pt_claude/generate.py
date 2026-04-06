@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from .attention import Attention
-from .config import AttentionType, Gemma4Config, make_attention_pattern
+from .config import AttentionType, Gemma4Config, build_kv_sharing_patterns, make_attention_pattern
 from .model import Gemma4Model
 
 
@@ -44,11 +44,18 @@ def init_cache(
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cpu",
 ) -> dict:
-    """Initialise KV cache for all layers."""
+    """Initialise KV cache for all layers.
+
+    Shared (borrower) layers are skipped — they reuse the source layer's
+    cache directly, saving memory and keeping each cache entry self-consistent.
+    """
     text = cfg.text
     attn_types = make_attention_pattern(text.attention_pattern, text.num_layers)
+    kv_patterns = build_kv_sharing_patterns(text.num_layers, attn_types, text.kv_sharing)
     cache = {}
     for i in range(text.num_layers):
+        if kv_patterns[i] != i:
+            continue  # shared layer — no cache allocation
         is_global = attn_types[i] == AttentionType.GLOBAL
         layer_head_dim = (text.global_head_dim or text.head_dim) if is_global else text.head_dim
         layer_kv_heads = (text.num_global_kv_heads or text.num_kv_heads) if is_global else text.num_kv_heads

@@ -331,11 +331,13 @@ class TextDecoder(nn.Module):
 
         for i, block in enumerate(self.blocks):
             layer_name = f"layer_{i}"
+            source_idx = self.kv_sharing_patterns[i]
+            is_shared = source_idx != i
 
             # KV sharing: check if this layer borrows KV from an earlier layer
             shared_kv = None
-            if self.kv_sharing_patterns[i] != i:
-                shared_name = f"layer_{self.kv_sharing_patterns[i]}"
+            if is_shared:
+                shared_name = f"layer_{source_idx}"
                 shared_kv = new_cache.get(shared_name)
 
             pli = per_layer_inputs[..., i, :] if per_layer_inputs is not None else None
@@ -344,11 +346,16 @@ class TextDecoder(nn.Module):
                 x,
                 positions,
                 attn_mask,
-                cache=old_cache.get(layer_name),
+                cache=old_cache.get(layer_name),  # None for shared layers
                 shared_kv_cache=shared_kv,
                 per_layer_input=pli,
             )
-            new_cache[layer_name] = layer_cache
+
+            if is_shared:
+                # Store the canonical source cache — self-consistent, no phantom buffers
+                new_cache[layer_name] = new_cache[f"layer_{source_idx}"]
+            else:
+                new_cache[layer_name] = layer_cache
 
         x = self.final_norm(x)
         logits = self.embedder.decode_logits(x)

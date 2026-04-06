@@ -3,7 +3,14 @@
 import torch
 import pytest
 
-from gemma4_pt_claude.config import AttentionType, Gemma4Config, TextConfig
+from gemma4_pt_claude.config import (
+    AttentionType,
+    Gemma4Config,
+    KVCacheSharingConfig,
+    TextConfig,
+    build_kv_sharing_patterns,
+    make_attention_pattern,
+)
 from gemma4_pt_claude.model import (
     Gemma4Model,
     build_audio_token_mask,
@@ -190,3 +197,112 @@ class TestAudioHelpers:
         expected_mask = torch.tensor([[True, True, True]], dtype=torch.bool)
         assert torch.equal(flat_embeddings, expected_embeddings)
         assert torch.equal(flat_mask, expected_mask)
+
+
+def _tiny_shared_config() -> Gemma4Config:
+    """Config with KV sharing: 6 layers, layers 0-2 unshared, 3-5 shared."""
+    text = TextConfig(
+        vocab_size=64,
+        embed_dim=32,
+        hidden_dim=64,
+        num_heads=2,
+        head_dim=16,
+        num_kv_heads=2,
+        num_layers=6,
+        sliding_window_size=16,
+        attention_pattern=(AttentionType.LOCAL_SLIDING, AttentionType.GLOBAL),
+        use_qk_norm=True,
+        use_value_norm=False,
+        use_post_attn_norm=True,
+        use_post_ffw_norm=True,
+        kv_sharing=KVCacheSharingConfig(
+            frac_shared_layers=0.5,
+            share_global=True,
+            share_local=True,
+        ),
+    )
+    return Gemma4Config(text=text)
+
+
+class TestSharedKVCache:
+    def test_init_cache_skips_shared_layers(self):
+        cfg = _tiny_shared_config()
+        cache = init_cache(cfg, batch_size=1, cache_length=16)
+        text = cfg.text
+        attn_types = make_attention_pattern(text.attention_pattern, text.num_layers)
+        patterns = build_kv_sharing_patterns(text.num_layers, attn_types, text.kv_sharing)
+
+        # Only source layers should have cache entries
+        for i in range(text.num_layers):
+            key = f"layer_{i}"
+            if patterns[i] == i:
+                assert key in cache, f"Source layer {i} missing from cache"
+            else:
+                assert key not in cache, f"Shared layer {i} should not be in cache"
+
+    def test_shared_cache_entries_are_same_object(self):
+        cfg = _tiny_shared_config()
+        model = Gemma4Model(cfg)
+        model.eval()
+
+        B, L = 1, 4
+        cache = init_cache(cfg, B, 16)
+        tokens = torch.randint(0, 64, (B, L))
+        _, new_cache = model(tokens, cache=cache)
+
+        text = cfg.text
+        attn_types = make_attention_pattern(text.attention_pattern, text.num_layers)
+        patterns = build_kv_sharing_patterns(text.num_layers, attn_types, text.kv_sharing)
+
+        for i in range(text.num_layers):
+            if patterns[i] != i:
+                source_name = f"layer_{patterns[i]}"
+                shared_name = f"layer_{i}"
+                assert new_cache[shared_name] is new_cache[source_name], (
+                    f"Layer {i} cache should be same object as source layer {patterns[i]}"
+                )
+
+    def test_shared_cache_end_index_consistent(self):
+        cfg = _tiny_shared_config()
+        model = Gemma4Model(cfg)
+        model.eval()
+
+        B, L = 1, 4
+        cache = init_cache(cfg, B, 16)
+        tokens = torch.randint(0, 64, (B, L))
+        _, cache = model(tokens, cache=cache)
+
+        # All cache entries should have the same end_index
+        end_indices = [cache[k]["end_index"].item() for k in cache]
+        assert all(e == end_indices[0] for e in end_indices), (
+            f"end_index mismatch across layers: {end_indices}"
+        )
+
+    def test_shared_cache_decode_step(self):
+        """Shared cache works correctly across prefill + decode."""
+        cfg = _tiny_shared_config()
+        model = Gemma4Model(cfg)
+        model.eval()
+
+        B = 1
+        cache = init_cache(cfg, B, 16)
+        tokens = torch.randint(0, 64, (B, 4))
+        _, cache = model(tokens, cache=cache)
+
+        # Decode one token
+        next_tok = torch.randint(0, 64, (B, 1))
+        _, cache = model(next_tok, cache=cache)
+
+        text = cfg.text
+        attn_types = make_attention_pattern(text.attention_pattern, text.num_layers)
+        patterns = build_kv_sharing_patterns(text.num_layers, attn_types, text.kv_sharing)
+
+        # Shared layers should still be same object as source after decode
+        for i in range(text.num_layers):
+            if patterns[i] != i:
+                assert cache[f"layer_{i}"] is cache[f"layer_{patterns[i]}"]
+
+        # end_index should be 5 (4 prefill + 1 decode) for source layers
+        for i in range(text.num_layers):
+            if patterns[i] == i:
+                assert cache[f"layer_{i}"]["end_index"].item() == 5
