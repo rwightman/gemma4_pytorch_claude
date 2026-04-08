@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .attention import Attention, LayerCache
 from .config import AttentionType, TextConfig, build_kv_sharing_patterns, make_attention_pattern
-from .layers import GatedMLP, RMSNorm
+from .layers import GatedMLP, RMSNorm, TanhGELU
 from .moe import MoELayer
 
 
@@ -96,11 +96,12 @@ class PerLayerMapping(nn.Module):
     def __init__(self, embed_dim: int, pli_dim: int):
         super().__init__()
         self.gate = nn.Linear(embed_dim, pli_dim, bias=False)
+        self.act = TanhGELU()
         self.proj = nn.Linear(pli_dim, embed_dim, bias=False)
         self.norm = RMSNorm(embed_dim, scale_plus_one=False)
 
     def forward(self, x: torch.Tensor, pli: torch.Tensor) -> torch.Tensor:
-        g = F.gelu(self.gate(x))
+        g = self.act(self.gate(x))
         out = self.proj(g * pli)
         return self.norm(out)
 

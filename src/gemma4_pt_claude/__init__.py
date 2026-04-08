@@ -17,7 +17,7 @@ from .config import (
 )
 
 # Core modules
-from .layers import RMSNorm, GatedMLP, ClippedLinear, apply_rope, apply_multidimensional_rope
+from .layers import TanhGELU, RMSNorm, GatedMLP, ClippedLinear, apply_rope, apply_multidimensional_rope
 from .attention import Attention, LayerCache
 from .moe import MoELayer, MoERouter, MoEExperts
 from .transformer import TextDecoder, TransformerBlock, Embedder
@@ -72,6 +72,7 @@ __all__ = [
     "make_attention_pattern",
     # Layers
     "RMSNorm",
+    "TanhGELU",
     "GatedMLP",
     "ClippedLinear",
     "apply_rope",

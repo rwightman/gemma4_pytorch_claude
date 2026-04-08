@@ -3,6 +3,7 @@
 import torch
 import pytest
 
+from gemma4_pt_claude.layers import TanhGELU
 from gemma4_pt_claude.moe import MoERouter, MoEExperts, MoELayer
 
 
@@ -37,6 +38,10 @@ class TestMoEExperts:
         indices = torch.randint(0, 8, (1, 4, 2))
         out = experts(x, weights, indices)
         assert out.shape == (1, 4, 32)
+
+    def test_uses_tanh_gelu_module(self):
+        experts = MoEExperts(num_experts=8, features=32, expert_dim=16)
+        assert isinstance(experts.act, TanhGELU)
 
 
 class TestMoELayer:

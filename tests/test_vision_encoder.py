@@ -8,10 +8,11 @@ from gemma4_pt_claude.vision_encoder import (
     VisionPatchEmbedder,
     VisionAttention,
     VisionBlock,
+    VisionMLP,
     VisionPooler,
     VisionEncoder,
 )
-from gemma4_pt_claude.layers import ClippedLinear
+from gemma4_pt_claude.layers import ClippedLinear, TanhGELU
 
 
 def _tiny_vision_config(**overrides) -> VisionConfig:
@@ -92,6 +93,13 @@ class TestVisionAttention:
         pos_ids = torch.zeros(B, L, 2, dtype=torch.long)
         out = attn(x, mask, pos_ids)
         assert not torch.isnan(out).any()
+
+
+class TestVisionMLP:
+    def test_uses_tanh_gelu_module(self):
+        cfg = _tiny_vision_config()
+        mlp = VisionMLP(cfg)
+        assert isinstance(mlp.act, TanhGELU)
 
 
 class TestVisionPooler:

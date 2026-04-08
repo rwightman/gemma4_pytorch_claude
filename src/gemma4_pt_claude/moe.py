@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .layers import RMSNorm
+from .layers import RMSNorm, TanhGELU
 
 
 class MoERouter(nn.Module):
@@ -57,6 +57,7 @@ class MoEExperts(nn.Module):
         self.down = nn.Parameter(torch.empty(num_experts, expert_dim, features))
         # Per-expert scale (init ones)
         self.per_expert_scale = nn.Parameter(torch.ones(num_experts))
+        self.act = TanhGELU()
         self._init_weights()
 
     def _init_weights(self):
@@ -100,7 +101,7 @@ class MoEExperts(nn.Module):
             # gate_up projection
             h = torch.bmm(x_flat.unsqueeze(1), gu).squeeze(1)  # [B*L, 2*H]
             gate, up = h.chunk(2, dim=-1)
-            act = F.gelu(gate) * up  # [B*L, H]
+            act = self.act(gate) * up  # [B*L, H]
 
             # down projection
             y = torch.bmm(act.unsqueeze(1), dw).squeeze(1)  # [B*L, D]

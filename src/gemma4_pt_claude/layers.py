@@ -1,4 +1,4 @@
-"""Shared primitives: RMSNorm, RoPE, GatedMLP, ClippedLinear."""
+"""Shared primitives: RMSNorm, RoPE, TanhGELU, GatedMLP, ClippedLinear."""
 
 from __future__ import annotations
 
@@ -133,8 +133,21 @@ def apply_multidimensional_rope(
 
 
 # ---------------------------------------------------------------------------
+# TanhGELU
+# ---------------------------------------------------------------------------
+
+
+class TanhGELU(nn.Module):
+    """Gemma-style GELU using the tanh approximation."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x, approximate="tanh")
+
+
+# ---------------------------------------------------------------------------
 # GatedMLP
 # ---------------------------------------------------------------------------
+
 
 class GatedMLP(nn.Module):
     """Gated feed-forward: ``down(gelu(gate) * up)``.
@@ -146,11 +159,12 @@ class GatedMLP(nn.Module):
     def __init__(self, features: int, hidden_dim: int):
         super().__init__()
         self.gate_up_proj = nn.Linear(features, 2 * hidden_dim, bias=False)
+        self.act = TanhGELU()
         self.down_proj = nn.Linear(hidden_dim, features, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(F.gelu(gate) * up)
+        return self.down_proj(self.act(gate) * up)
 
 
 # ---------------------------------------------------------------------------

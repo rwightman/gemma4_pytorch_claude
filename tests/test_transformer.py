@@ -4,6 +4,7 @@ import torch
 import pytest
 
 from gemma4_pt_claude.config import AttentionType, TextConfig
+from gemma4_pt_claude.layers import TanhGELU
 from gemma4_pt_claude.transformer import Embedder, PerLayerMapping, TransformerBlock, TextDecoder
 
 
@@ -74,6 +75,10 @@ class TestPerLayerMapping:
         pli = torch.randn(2, 8, 16)
         out = plm(x, pli)
         assert out.shape == (2, 8, 64)
+
+    def test_uses_tanh_gelu_module(self):
+        plm = PerLayerMapping(64, 16)
+        assert isinstance(plm.act, TanhGELU)
 
 
 class TestTransformerBlock:

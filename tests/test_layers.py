@@ -3,7 +3,13 @@
 import torch
 import pytest
 
-from gemma4_pt_claude.layers import RMSNorm, GatedMLP, apply_rope, apply_multidimensional_rope
+from gemma4_pt_claude.layers import (
+    GatedMLP,
+    RMSNorm,
+    TanhGELU,
+    apply_multidimensional_rope,
+    apply_rope,
+)
 
 
 class TestRMSNorm:
@@ -62,6 +68,10 @@ class TestGatedMLP:
         mlp = GatedMLP(32, 128)
         assert mlp.gate_up_proj.weight.shape == (256, 32)  # 2*hidden, features
         assert mlp.down_proj.weight.shape == (32, 128)
+
+    def test_uses_tanh_gelu_module(self):
+        mlp = GatedMLP(32, 128)
+        assert isinstance(mlp.act, TanhGELU)
 
 
 class TestRoPE:

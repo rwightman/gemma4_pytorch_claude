@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import VisionConfig
-from .layers import ClippedLinear, RMSNorm, apply_multidimensional_rope
+from .layers import ClippedLinear, RMSNorm, TanhGELU, apply_multidimensional_rope
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +95,11 @@ class VisionMLP(nn.Module):
         super().__init__()
         self.gate_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden)
         self.up_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden)
+        self.act = TanhGELU()
         self.down_proj = _make_vision_proj(cfg, cfg.ffw_hidden, cfg.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
+        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ---------------------------------------------------------------------------
