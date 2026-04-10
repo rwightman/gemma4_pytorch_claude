@@ -61,34 +61,35 @@ https://forum.obsidian.md/t/image-captions-problem/90796  (first image)
 
 ```
   Image Caption Test
+
   Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
+
   Heading
+
   [[image.jpg]This is a caption with [a link to Obsidian](https://obsidian.md)]
-  This is a caption with a link to Obsidian
-  consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
-  Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia
+
+  This is a caption with a link to Obsidian 🔗
+
+  consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna
+  aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
+  commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore
+  eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia
 ```
 
 ### transformers 5.5.0
 ```
   Image Caption Test
+
   Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
-  Image Caption Test
+
   Heading
+
   [[image.jpg]This is a caption with [a link to Obsidian](https://obsidian.md)]
-  This is a caption with a link to Obsidian
+
+  This is a caption with a link to Obsidian 🔗
+
+  consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
+  Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia
 ```
 
 # Audio Transcribe Test
