@@ -24,6 +24,73 @@ The customer is clearly ready to sign the contract, even if the delivery involve
 The store is clearly facing a prehistoric challenge.
 
 
+# Image OCR Test
+
+## Image & Prompt
+```
+ <|turn>user
+  <|image|>
+  Extract all visible text from this image exactly. Return only the extracted text. Preserve line breaks if possible.
+  <turn|>
+  <|turn>model
+```
+
+https://forum.obsidian.md/t/image-captions-problem/90796  (first image)
+
+## Response
+
+### gemma4_pytorch_codex
+```
+  Image Caption Test
+
+  Image Caption Test
+
+  Heading
+
+  [[image.jpg][This is a caption with [a link to Obsidian](https://obsidian.md)]]
+
+  This is a caption with a link to Obsidian 🔗
+
+  consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna
+  aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
+  commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore
+  eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia
+```
+
+### gemma4_pytorch_claude
+
+```
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Heading
+  [[image.jpg]This is a caption with [a link to Obsidian](https://obsidian.md)]
+  This is a caption with a link to Obsidian
+  consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
+  Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia
+```
+
+### transformers 5.5.0
+```
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Image Caption Test
+  Heading
+  [[image.jpg]This is a caption with [a link to Obsidian](https://obsidian.md)]
+  This is a caption with a link to Obsidian
+```
+
 # Audio Transcribe Test
 
 ## Audio & Prompt
