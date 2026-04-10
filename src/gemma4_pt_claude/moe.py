@@ -18,15 +18,17 @@ class MoERouter(nn.Module):
 
     def __init__(self, features: int, num_experts: int, top_k: int):
         super().__init__()
+        self.features = features
         self.top_k = top_k
         self.num_experts = num_experts
         self.norm = RMSNorm(features, with_scale=False)
         self.gate = nn.Linear(features, num_experts, bias=False)
         # Per-feature learned router scale (init ones), times rsqrt(features)
         self.router_scale = nn.Parameter(torch.ones(features))
-        self.register_buffer(
-            "root_size", torch.tensor(features ** -0.5), persistent=False
-        )
+        self.root_size = self._build_root_size()
+
+    def _build_root_size(self) -> float:
+        return self.features ** -0.5
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (weights, expert_indices) both ``[B, L, top_k]``."""

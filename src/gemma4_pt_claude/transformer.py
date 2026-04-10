@@ -37,17 +37,14 @@ class Embedder(nn.Module):
             self.pli_proj = nn.Linear(cfg.embed_dim, num_layers * cfg.per_layer_input_dim, bias=False)
             self.pli_proj_norm = RMSNorm(cfg.per_layer_input_dim, scale_plus_one=False)
             self.num_layers = num_layers
-            # Scale factors
-            self.register_buffer(
-                "pli_proj_scale",
-                torch.tensor(float(cfg.embed_dim) ** -0.5),
-                persistent=False,
-            )
-            self.register_buffer(
-                "pli_combine_scale",
-                torch.tensor(1.0 / math.sqrt(2.0)),
-                persistent=False,
-            )
+            self.pli_proj_scale = self._build_pli_proj_scale()
+            self.pli_combine_scale = self._build_pli_combine_scale()
+
+    def _build_pli_proj_scale(self) -> float:
+        return float(self.embed_dim) ** -0.5
+
+    def _build_pli_combine_scale(self) -> float:
+        return 1.0 / math.sqrt(2.0)
 
     def encode(self, tokens: torch.Tensor) -> torch.Tensor:
         """``[B, L] -> [B, L, D]`` with sqrt(D) scaling."""
@@ -150,6 +147,11 @@ class TransformerBlock(nn.Module):
             if cfg.global_rope_proportion > 0
             else cfg.rope_proportion
         )
+        k_eq_v = (
+            cfg.k_eq_v
+            if attn_type == AttentionType.LOCAL_SLIDING
+            else cfg.k_eq_v_global
+        )
 
         # Pre/post attention norms
         self.pre_attn_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
@@ -166,7 +168,7 @@ class TransformerBlock(nn.Module):
             attn_logits_soft_cap=cfg.attn_logits_soft_cap,
             use_qk_norm=cfg.use_qk_norm,
             use_value_norm=cfg.use_value_norm,
-            k_eq_v=cfg.k_eq_v,
+            k_eq_v=k_eq_v,
             attn_impl=cfg.attn_impl,
         )
         self.post_attn_norm = (

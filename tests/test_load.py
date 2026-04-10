@@ -7,7 +7,7 @@ import torch
 import pytest
 from safetensors.torch import save_file
 
-from gemma4_pt_claude.config import AttentionType, Gemma4Config, TextConfig
+from gemma4_pt_claude.config import AttentionType, AudioConfig, Gemma4Config, TextConfig
 from gemma4_pt_claude.model import Gemma4Model
 from gemma4_pt_claude.load import (
     load_weights,
@@ -116,25 +116,43 @@ class TestHFConvertWeights:
 
 
 class TestLoadWeights:
+    @staticmethod
+    def _runtime_buffer_config(with_audio: bool = False) -> Gemma4Config:
+        text = TextConfig(
+            vocab_size=32,
+            embed_dim=16,
+            hidden_dim=32,
+            num_heads=2,
+            head_dim=8,
+            num_kv_heads=2,
+            num_layers=1,
+            sliding_window_size=8,
+            attention_pattern=(AttentionType.GLOBAL,),
+            use_qk_norm=False,
+            use_value_norm=False,
+            use_post_attn_norm=False,
+            use_post_ffw_norm=False,
+            per_layer_input_dim=4,
+        )
+        audio = None
+        if with_audio:
+            audio = AudioConfig(
+                hidden_size=16,
+                num_layers=1,
+                num_heads=4,
+                chunk_size=4,
+                context_left=5,
+                context_right=0,
+                conv_kernel_size=3,
+                input_feat_size=8,
+                sscp_channels=(8, 4),
+                lm_model_dims=16,
+            )
+        return Gemma4Config(text=text, audio=audio)
+
     @pytest.fixture
     def tiny_model(self):
-        cfg = Gemma4Config(
-            text=TextConfig(
-                vocab_size=32,
-                embed_dim=16,
-                hidden_dim=32,
-                num_heads=2,
-                head_dim=8,
-                num_kv_heads=2,
-                num_layers=1,
-                sliding_window_size=8,
-                attention_pattern=(AttentionType.GLOBAL,),
-                use_qk_norm=False,
-                use_value_norm=False,
-                use_post_attn_norm=False,
-                use_post_ffw_norm=False,
-            ),
-        )
+        cfg = self._runtime_buffer_config()
         return Gemma4Model(cfg)
 
     def test_load_our_format(self, tiny_model):
@@ -166,6 +184,41 @@ class TestLoadWeights:
             missing, unexpected = load_weights(tiny_model, path, format="auto")
             assert missing == []
 
+    def test_init_non_persistent_buffers_recurses(self):
+        model = Gemma4Model(self._runtime_buffer_config(with_audio=True))
+        embedder = model.text_decoder.embedder
+        audio_attn = model.audio_encoder.conformer[0].attn.attn
+
+        embedder.pli_proj_scale = 0.0
+        audio_attn.q_scale_base = 0.0
+        audio_attn.key_scale = 0.0
+        audio_attn.local_causal_mask = torch.zeros_like(audio_attn.local_causal_mask)
+
+        model.init_non_persistent_buffers()
+
+        assert embedder.pli_proj_scale == 0.0
+        assert audio_attn.q_scale_base == 0.0
+        assert audio_attn.key_scale == 0.0
+        assert audio_attn.local_causal_mask.any()
+
+    def test_load_meta_model_rebuilds_runtime_buffers(self):
+        cfg = self._runtime_buffer_config(with_audio=True)
+        reference = Gemma4Model(cfg)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.safetensors"
+            save_file(reference.state_dict(), str(path))
+            with torch.device("meta"):
+                meta_model = Gemma4Model(cfg)
+            missing, unexpected = load_weights(meta_model, path, device="cpu")
+
+        assert missing == []
+        assert unexpected == []
+        assert not meta_model.text_decoder.embedder.token_embedding.weight.is_meta
+        assert isinstance(meta_model.text_decoder.embedder.pli_proj_scale, float)
+        assert meta_model.text_decoder.embedder.pli_proj_scale > 0.0
+        assert not meta_model.audio_encoder.conformer[0].attn.attn.local_causal_mask.is_meta
+
 
 class TestVisionKeyMapping:
     def test_patch_embedder(self):
@@ -183,6 +236,12 @@ class TestVisionKeyMapping:
             "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight"
         ) == "vision_encoder.layers.0.attn.q_proj.linear.weight"
 
+    def test_encoder_layer_attn_without_clipped_linear(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight",
+            use_clipped_linear=False,
+        ) == "vision_encoder.layers.0.attn.q_proj.weight"
+
     def test_encoder_layer_norm(self):
         assert _hf_vision_key_to_ours(
             "vision_tower.encoder.layers.5.input_layernorm.weight"
@@ -193,6 +252,12 @@ class TestVisionKeyMapping:
             "vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight"
         ) == "vision_encoder.layers.0.mlp.gate_proj.linear.weight"
 
+    def test_encoder_layer_mlp_without_clipped_linear(self):
+        assert _hf_vision_key_to_ours(
+            "vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight",
+            use_clipped_linear=False,
+        ) == "vision_encoder.layers.0.mlp.gate_proj.weight"
+
     def test_rotary_emb_skipped(self):
         assert _hf_vision_key_to_ours(
             "vision_tower.encoder.rotary_emb.inv_freq"
@@ -202,6 +267,10 @@ class TestVisionKeyMapping:
         assert _hf_vision_key_to_ours(
             "vision_tower.encoder.layers.0.self_attn.q_norm.weight"
         ) == "vision_encoder.layers.0.attn.q_norm.scale"
+
+    def test_standardize_buffers(self):
+        assert _hf_vision_key_to_ours("vision_tower.std_bias") == "vision_encoder.std_bias"
+        assert _hf_vision_key_to_ours("vision_tower.std_scale") == "vision_encoder.std_scale"
 
 
 class TestAudioKeyMapping:

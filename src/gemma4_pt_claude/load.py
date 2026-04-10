@@ -33,6 +33,7 @@ def _hf_key_to_ours(
         num_layers: int,
         has_vision: bool = False,
         has_audio: bool = False,
+        use_clipped_vision: bool | None = None,
 ) -> str | None:
     """Map a single HF key to our naming convention.
 
@@ -73,7 +74,7 @@ def _hf_key_to_ours(
 
     # --- Vision tower ---
     if k.startswith("vision_tower.") and has_vision:
-        return _hf_vision_key_to_ours(k)
+        return _hf_vision_key_to_ours(k, use_clipped_linear=use_clipped_vision)
 
     # --- Layer params ---
     if k.startswith("layers."):
@@ -292,7 +293,11 @@ def _hf_audio_key_to_ours(k: str) -> str | None:
     return None
 
 
-def _hf_vision_key_to_ours(k: str) -> str | None:
+def _hf_vision_key_to_ours(
+        k: str,
+        *,
+        use_clipped_linear: bool | None = None,
+) -> str | None:
     """Map a single HF vision_tower key (prefix already stripped to ``vision_tower.``)."""
     # --- Patch embedder ---
     if k.startswith("vision_tower.patch_embedder.input_proj."):
@@ -300,6 +305,10 @@ def _hf_vision_key_to_ours(k: str) -> str | None:
         return f"vision_encoder.patch_embedder.input_proj.{suffix}"
     if k == "vision_tower.patch_embedder.position_embedding_table":
         return "vision_encoder.patch_embedder.position_embedding_table"
+    if k == "vision_tower.std_bias":
+        return "vision_encoder.std_bias"
+    if k == "vision_tower.std_scale":
+        return "vision_encoder.std_scale"
 
     # --- Encoder rotary_emb (skip — recomputed) ---
     if "rotary_emb" in k:
@@ -320,6 +329,8 @@ def _hf_vision_key_to_ours(k: str) -> str | None:
             attn_prefix = f"self_attn.{proj_name}."
             if rest.startswith(attn_prefix):
                 suffix = rest[len(attn_prefix):]
+                if use_clipped_linear is False and suffix.startswith("linear."):
+                    suffix = suffix[len("linear."):]
                 return f"{prefix}.attn.{proj_name}.{suffix}"
 
         # QK/V norms
@@ -335,6 +346,8 @@ def _hf_vision_key_to_ours(k: str) -> str | None:
             mlp_prefix = f"mlp.{proj_name}."
             if rest.startswith(mlp_prefix):
                 suffix = rest[len(mlp_prefix):]
+                if use_clipped_linear is False and suffix.startswith("linear."):
+                    suffix = suffix[len("linear."):]
                 return f"{prefix}.mlp.{proj_name}.{suffix}"
 
         # Layer norms
@@ -355,6 +368,7 @@ def _hf_convert_weights(
         num_layers: int,
         has_vision: bool = False,
         has_audio: bool = False,
+        use_clipped_vision: bool | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convert HF safetensors keys to our naming, merging gate/up projections."""
     mapped: dict[str, torch.Tensor] = {}
@@ -382,7 +396,13 @@ def _hf_convert_weights(
             up_projs[layer_idx] = tensor
             continue
 
-        our_key = _hf_key_to_ours(hf_key, num_layers, has_vision=has_vision, has_audio=has_audio)
+        our_key = _hf_key_to_ours(
+            hf_key,
+            num_layers,
+            has_vision=has_vision,
+            has_audio=has_audio,
+            use_clipped_vision=use_clipped_vision,
+        )
         if our_key is not None:
             mapped[our_key] = tensor
         else:
@@ -436,6 +456,7 @@ def load_weights(
         format: str = "auto",
         strict: bool = False,
         dtype: torch.dtype | None = None,
+        device: str | torch.device | None = None,
 ) -> tuple[list[str], list[str]]:
     """Load weights into a model from safetensors.
 
@@ -446,6 +467,7 @@ def load_weights(
             (HuggingFace naming).
         strict: If True, raise on missing/unexpected keys.
         dtype: Cast all loaded tensors to this dtype (e.g. ``torch.bfloat16``).
+        device: Optional materialization device for models initialized on ``meta``.
 
     Returns:
         (missing_keys, unexpected_keys) from ``load_state_dict``.
@@ -464,13 +486,39 @@ def load_weights(
         num_layers = model.cfg.text.num_layers
         has_vision = model.vision_encoder is not None
         has_audio = model.audio_encoder is not None
-        raw = _hf_convert_weights(raw, num_layers, has_vision=has_vision, has_audio=has_audio)
+        raw = _hf_convert_weights(
+            raw,
+            num_layers,
+            has_vision=has_vision,
+            has_audio=has_audio,
+            use_clipped_vision=(
+                model.cfg.vision.use_clipped_linear
+                if has_vision and model.cfg.vision is not None
+                else None
+            ),
+        )
+
+    is_meta_model = any(param.is_meta for param in model.parameters()) or any(
+        buffer.is_meta for buffer in model.buffers()
+    )
+
+    target_device = None if device is None else torch.device(device)
+    assign = False
+    if is_meta_model:
+        if dtype is not None:
+            model.to(dtype=dtype)
+        if target_device is not None and target_device.type != "cpu":
+            model.to_empty(device=target_device)
+            model.init_non_persistent_buffers()
+        else:
+            assign = True
 
     # Optional dtype cast
-    if dtype is not None:
+    if dtype is not None and (assign or not is_meta_model):
         raw = {k: v.to(dtype) for k, v in raw.items()}
 
-    result = model.load_state_dict(raw, strict=strict)
+    result = model.load_state_dict(raw, strict=strict, assign=assign)
+    model.init_non_persistent_buffers()
     missing = list(result.missing_keys) if hasattr(result, "missing_keys") else []
     unexpected = list(result.unexpected_keys) if hasattr(result, "unexpected_keys") else []
     return missing, unexpected

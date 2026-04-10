@@ -78,12 +78,12 @@ class TestChunkedLocalAttention:
             attn.per_dim_scale, torch.ones(cfg.hidden_size // cfg.num_heads),
         )
 
-    def test_key_scale_buffer(self, cfg):
-        """Should have a key_scale buffer for key scaling."""
+    def test_key_scale_scalar(self, cfg):
+        """Should have a positive scalar key scale for key scaling."""
         attn = ChunkedLocalAttention(cfg)
         assert hasattr(attn, "key_scale")
-        assert attn.key_scale.ndim == 0
-        assert attn.key_scale.item() > 0
+        assert isinstance(attn.key_scale, float)
+        assert attn.key_scale > 0.0
 
 
 class TestConformerLayer:

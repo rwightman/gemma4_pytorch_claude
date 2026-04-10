@@ -25,20 +25,27 @@ class RelativePositionEmbedding(nn.Module):
 
     def __init__(self, channels: int, num_heads: int, head_dim: int, max_backward: int, max_forward: int):
         super().__init__()
+        self.channels = channels
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.max_backward = max_backward
         self.max_forward = max_forward
 
         self.pos_proj = nn.Linear(channels, num_heads * head_dim, bias=False)
+        self.register_buffer("inv_timescales", self._build_inv_timescales(), persistent=False)
 
-        # Sinusoidal timescales
+    def _build_inv_timescales(self) -> torch.Tensor:
         min_timescale = 1.0
         max_timescale = 1.0e4
-        num_timescales = channels // 2
+        num_timescales = self.channels // 2
         log_inc = math.log(max_timescale / min_timescale) / max(num_timescales - 1, 1)
-        inv_ts = min_timescale * torch.exp(torch.arange(num_timescales) * -log_inc)
-        self.register_buffer("inv_timescales", inv_ts.float().unsqueeze(0).unsqueeze(0), persistent=False)
+        inv_ts = min_timescale * torch.exp(
+            torch.arange(num_timescales, device=self.pos_proj.weight.device) * -log_inc
+        )
+        return inv_ts.float().unsqueeze(0).unsqueeze(0)
+
+    def init_non_persistent_buffers(self) -> None:
+        self.inv_timescales = self._build_inv_timescales()
 
     def _timing_signal(self, positions: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         pos = positions.float().unsqueeze(-1)
@@ -113,22 +120,32 @@ class ChunkedLocalAttention(nn.Module):
         self.k_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
         self.v_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
 
-        # Query scale: rsoftplus(0)/sqrt(H) * softplus(per_dim_scale)
-        r_softplus_0 = 1.0 / F.softplus(torch.tensor(0.0)).item()
-        self.register_buffer("q_scale_base", torch.tensor(self.head_dim ** -0.5 * r_softplus_0), persistent=False)
-
-        # Key scaling: k *= r_softplus_0 * softplus(1.0)
-        key_scale = r_softplus_0 * F.softplus(torch.tensor(1.0)).item()
-        self.register_buffer("key_scale", torch.tensor(key_scale), persistent=False)
-
-        # Local causal mask: [W, C]
+        self.q_scale_base = self._build_q_scale_base()
+        self.key_scale = self._build_key_scale()
         self.register_buffer("local_causal_mask", self._build_causal_mask(), persistent=False)
+
+    def _build_q_scale_base(self) -> float:
+        r_softplus_0 = 1.0 / math.log(2.0)
+        return self.head_dim ** -0.5 * r_softplus_0
+
+    def _build_key_scale(self) -> float:
+        r_softplus_0 = 1.0 / math.log(2.0)
+        return r_softplus_0 * math.log1p(math.e)
 
     def _build_causal_mask(self) -> torch.Tensor:
         W, C = self.chunk_size, self.context_size
-        lower = torch.tril(torch.ones(C, W, dtype=torch.bool), diagonal=0).T
-        upper = torch.tril(torch.ones(W, C, dtype=torch.bool), diagonal=self.max_past + self.max_future)
+        lower = torch.tril(
+            torch.ones(C, W, dtype=torch.bool, device=self.per_dim_scale.device),
+            diagonal=0,
+        ).T
+        upper = torch.tril(
+            torch.ones(W, C, dtype=torch.bool, device=self.per_dim_scale.device),
+            diagonal=self.max_past + self.max_future,
+        )
         return lower & upper
+
+    def init_non_persistent_buffers(self) -> None:
+        self.local_causal_mask = self._build_causal_mask()
 
     def _to_blocks(self, x: torch.Tensor) -> torch.Tensor:
         """``[B, T, ...]`` -> ``[B, U, W, ...]`` with padding."""

@@ -14,6 +14,21 @@ from .vision_encoder import VisionEncoder
 
 
 # ---------------------------------------------------------------------------
+# Runtime-only buffer init
+# ---------------------------------------------------------------------------
+
+def _run_non_persistent_buffer_init(module: nn.Module) -> None:
+    """Rebuild runtime-only buffers on child modules that opt into it."""
+    for submodule in module.modules():
+        if submodule is module:
+            continue
+        init_method = type(submodule).__dict__.get("init_non_persistent_buffers")
+        if init_method is None:
+            continue
+        init_method(submodule)
+
+
+# ---------------------------------------------------------------------------
 # Mask helpers
 # ---------------------------------------------------------------------------
 
@@ -202,6 +217,10 @@ class Gemma4Model(nn.Module):
             self.embed_audio = AudioEmbedder(
                 cfg.audio.lm_model_dims, cfg.text.embed_dim,
             )
+
+    def init_non_persistent_buffers(self) -> None:
+        """Rebuild runtime-only buffers after meta-init or state-dict assignment."""
+        _run_non_persistent_buffer_init(self)
 
     def forward(
             self,

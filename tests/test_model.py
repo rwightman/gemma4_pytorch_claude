@@ -105,6 +105,31 @@ class TestGemma4Model:
         assert model.vision_encoder is None
         assert model.audio_encoder is None
 
+    def test_global_layers_use_k_eq_v_global(self):
+        text = TextConfig(
+            vocab_size=64,
+            embed_dim=32,
+            hidden_dim=64,
+            num_heads=2,
+            head_dim=16,
+            num_kv_heads=2,
+            num_layers=2,
+            sliding_window_size=16,
+            attention_pattern=(AttentionType.LOCAL_SLIDING, AttentionType.GLOBAL),
+            use_qk_norm=True,
+            use_value_norm=False,
+            use_post_attn_norm=True,
+            use_post_ffw_norm=True,
+            k_eq_v=False,
+            k_eq_v_global=True,
+        )
+        model = Gemma4Model(Gemma4Config(text=text))
+
+        assert model.text_decoder.blocks[0].attn.k_eq_v is False
+        assert model.text_decoder.blocks[1].attn.k_eq_v is True
+        assert hasattr(model.text_decoder.blocks[0].attn, "v_proj")
+        assert not hasattr(model.text_decoder.blocks[1].attn, "v_proj")
+
 
 class TestCacheValidMask:
     def test_valid_mask_after_prefill(self):
