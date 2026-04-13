@@ -30,55 +30,123 @@ pip install -e ".[convert]"  # adds jax + orbax (for JAX checkpoint conversion)
 
 ## Quickstart
 
-### Build a model and load weights
+### Fresh model vs checkpoint load
+
+Top-level factory functions behave differently depending on whether you construct
+them normally or under a meta-device context:
+
+- normal construction: creates a fully initialized model
+- `with torch.device("meta")`: creates an unmaterialized model, intended for checkpoint loading
+
+If you want a fresh random-init model:
+
+```python
+import gemma4_pt_claude as gemma4
+
+model = gemma4.gemma4_e2b(text_only=True)
+model.eval()
+```
+
+If you want to load a real checkpoint, the recommended path for large HuggingFace
+checkpoints is meta construction plus streaming load:
 
 ```python
 import torch
 import gemma4_pt_claude as gemma4
 
-model = gemma4.gemma4_e2b()
-gemma4.load_weights(model, "/path/to/weights/", format="hf")
-model.to("cuda", dtype=torch.bfloat16).eval()
+weights_dir = "/path/to/hf-model-dir"
+
+with torch.device("meta"):
+    model = gemma4.gemma4_e2b(text_only=False)
+
+gemma4.load_weights_streaming(
+    model,
+    weights_dir,
+    format="hf",
+    dtype=torch.bfloat16,
+    device="cuda",
+)
+model.eval()
 ```
 
-Use `text_only=True` to skip vision/audio encoders if you only need text:
-
-```python
-model = gemma4.gemma4_e2b(text_only=True)
-```
+Use `text_only=True` to skip vision/audio encoders when you only need text.
 
 ### Text generation
 
-```python
-tokenizer = gemma4.Gemma4Tokenizer("/path/to/weights/")
-tokens = tokenizer.encode("The meaning of life is", add_bos=True)
-
-input_ids = torch.tensor([tokens], device="cuda")
-output = gemma4.generate(model, input_ids, max_new_tokens=128, temperature=0.0)
-print(tokenizer.decode(output[0].tolist()))
-```
-
-### Chat (single-turn)
+For instruction-tuned checkpoints, prefer `chat()` for single-turn prompts:
 
 ```python
-response = gemma4.chat(model, tokenizer, "Explain RoPE embeddings like I'm five.")
+import torch
+import gemma4_pt_claude as gemma4
+
+weights_dir = "/path/to/hf-model-dir"
+tokenizer = gemma4.Gemma4Tokenizer(weights_dir)
+
+with torch.device("meta"):
+    model = gemma4.gemma4_e2b(text_only=True)
+gemma4.load_weights_streaming(
+    model,
+    weights_dir,
+    format="hf",
+    dtype=torch.bfloat16,
+    device="cuda",
+)
+model.eval()
+
+response = gemma4.chat(
+    model,
+    tokenizer,
+    "Explain rotary position embeddings in plain English.",
+    max_new_tokens=192,
+    temperature=0.0,
+)
 print(response)
 ```
 
-`chat()` wraps your prompt in the Gemma 4 chat template and handles generation + decoding.
+For lower-level control, build the chat prompt yourself and call `generate()`:
+
+```python
+prompt_ids = [tokenizer.BOS, tokenizer.START_OF_TURN]
+prompt_ids += tokenizer.encode("user\nSummarize grouped-query attention.")
+prompt_ids += [tokenizer.END_OF_TURN]
+prompt_ids += tokenizer.encode("\n")
+prompt_ids += [tokenizer.START_OF_TURN]
+prompt_ids += tokenizer.encode("model\n")
+
+tokens = torch.tensor([prompt_ids], device="cuda")
+output = gemma4.generate(model, tokens, max_new_tokens=128, temperature=0.0)
+
+gen_ids = output[0, len(prompt_ids):].tolist()
+for i, tid in enumerate(gen_ids):
+    if tid in {tokenizer.EOS, tokenizer.END_OF_TURN}:
+        gen_ids = gen_ids[:i]
+        break
+print(tokenizer.decode(gen_ids))
+```
 
 ## Multimodal: The Composer
 
-The `Composer` class is the recommended way to do multimodal inference. It handles image/audio preprocessing, placeholder token injection, and chat template formatting in one call.
+The `Composer` class is the recommended multimodal entrypoint. It handles:
+
+- image/audio preprocessing
+- placeholder token injection
+- Gemma 4 chat formatting
+
+Prefer `compose_chat(...)` unless you already have a fully formatted prompt and
+need the lower-level `compose(...)` path.
 
 ```python
-from gemma4_pt_claude import Composer, Gemma4Tokenizer, gemma4_e2b, load_weights, generate
+import torch
+from gemma4_pt_claude import Composer, Gemma4Tokenizer, gemma4_e2b, load_weights_streaming, generate
 
-model = gemma4_e2b()
-load_weights(model, "/path/to/weights/", format="hf")
-model.to("cuda", dtype=torch.bfloat16).eval()
+weights_dir = "/path/to/hf-model-dir"
 
-tokenizer = Gemma4Tokenizer("/path/to/weights/")
+with torch.device("meta"):
+    model = gemma4_e2b()
+load_weights_streaming(model, weights_dir, format="hf", dtype=torch.bfloat16, device="cuda")
+model.eval()
+
+tokenizer = Gemma4Tokenizer(weights_dir)
 composer = Composer(tokenizer, model.cfg)
 ```
 
@@ -161,12 +229,14 @@ composed = composer.compose_chat(
 )
 ```
 
-### Manual image pipeline (without Composer)
+### Low-level image path (without Composer)
 
-If you need lower-level control, you can preprocess images directly:
+If you need full manual control, you can preprocess images directly and build
+the multimodal prompt yourself:
 
 ```python
 from PIL import Image
+import torch
 import gemma4_pt_claude as gemma4
 
 img = Image.open("photo.jpg")
@@ -208,19 +278,56 @@ output = gemma4.generate(
 )
 ```
 
+Practical note:
+
+- `temperature=0.0` is greedy and is the safest setting for comparisons/regression tests
+- very high temperatures with `top_k=0` and `top_p=1.0` will produce degenerate sampling quickly
+
 ## Weight Loading
 
-Supports HuggingFace safetensors directories and JAX Orbax checkpoints (after conversion):
+Supports HuggingFace safetensors directories and native safetensors files.
+
+For large HF checkpoints, prefer the streaming loader:
 
 ```python
-# HuggingFace model directory (auto-detects safetensors files)
+# HuggingFace model directory
+with torch.device("meta"):
+    model = gemma4.gemma4_31b(text_only=False)
+gemma4.load_weights_streaming(
+    model,
+    "/path/to/hf-model/",
+    format="hf",
+    dtype=torch.bfloat16,
+    device="cuda",
+)
+model.eval()
+```
+
+The non-streaming loader remains available:
+
+```python
+# HuggingFace model directory (remaps weights through a temporary CPU dict)
 gemma4.load_weights(model, "/path/to/hf-model/", format="hf")
 
 # Single safetensors file (native format)
 gemma4.load_weights(model, "model.safetensors")
 ```
 
-HuggingFace weight conversion handles gate/up projection merging, key remapping, and everything else automatically.
+Both loaders handle:
+
+- HF key remapping
+- gate/up projection merging
+- MoE routing/expert remaps
+- vision/audio tensor name conversion
+
+### Best Practices
+
+- Use meta construction plus `load_weights_streaming(...)` for large HF checkpoints.
+- Use normal construction only when you want a fresh randomly initialized model.
+- Call `model.eval()` after loading.
+- Use `compose_chat(...)` for multimodal prompts unless you already have a fully templated prompt.
+- Use `text_only=True` if you do not need vision/audio towers.
+- Keep `temperature=0.0` for deterministic eval and debugging.
 
 ### Converting JAX checkpoints
 
