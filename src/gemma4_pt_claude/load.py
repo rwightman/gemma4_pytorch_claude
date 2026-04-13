@@ -31,6 +31,7 @@ from .model import Gemma4Model
 def _hf_key_to_ours(
         hf_key: str,
         num_layers: int,
+        has_moe: bool = False,
         has_vision: bool = False,
         has_audio: bool = False,
         use_clipped_vision: bool | None = None,
@@ -97,10 +98,12 @@ def _hf_key_to_ours(
         if rest in _attn_map:
             return f"{prefix}.{_attn_map[rest]}"
 
+        ffw_prefix = "mlp2" if has_moe else "ffw"
+
         # MLP — fused gate_up_proj (our format) or separate (handled by merge)
         _mlp_map = {
-            "mlp.gate_up_proj.weight": "ffw.gate_up_proj.weight",
-            "mlp.down_proj.weight": "ffw.down_proj.weight",
+            "mlp.gate_up_proj.weight": f"{ffw_prefix}.gate_up_proj.weight",
+            "mlp.down_proj.weight": f"{ffw_prefix}.down_proj.weight",
         }
         if rest in _mlp_map:
             return f"{prefix}.{_mlp_map[rest]}"
@@ -109,13 +112,30 @@ def _hf_key_to_ours(
         if rest in ("mlp.gate_proj.weight", "mlp.up_proj.weight"):
             return None  # handled specially
 
+        if has_moe:
+            _moe_map = {
+                "experts.gate_up_proj": "moe.experts.gate_up",
+                "experts.down_proj": "moe.experts.down",
+                "router.proj.weight": "moe.router.gate.weight",
+                "router.scale": "moe.router.router_scale",
+                "router.per_expert_scale": "moe.experts.per_expert_scale",
+            }
+            if rest in _moe_map:
+                return f"{prefix}.{_moe_map[rest]}"
+
         # Norms
         _norm_map = {
             "input_layernorm.weight": "pre_attn_norm.weight",
             "post_attention_layernorm.weight": "post_attn_norm.weight",
-            "pre_feedforward_layernorm.weight": "pre_ffw_norm.weight",
+            "pre_feedforward_layernorm.weight": "pre_ffw2_norm.weight" if has_moe else "pre_ffw_norm.weight",
             "post_feedforward_layernorm.weight": "post_ffw_norm.weight",
         }
+        if has_moe:
+            _norm_map.update({
+                "pre_feedforward_layernorm_2.weight": "pre_ffw_norm.weight",
+                "post_feedforward_layernorm_1.weight": "post_ffw2_norm.weight",
+                "post_feedforward_layernorm_2.weight": "post_ffw1_norm.weight",
+            })
         if rest in _norm_map:
             return f"{prefix}.{_norm_map[rest]}"
 
@@ -366,6 +386,7 @@ def _hf_vision_key_to_ours(
 def _hf_convert_weights(
         raw: dict[str, torch.Tensor],
         num_layers: int,
+        has_moe: bool = False,
         has_vision: bool = False,
         has_audio: bool = False,
         use_clipped_vision: bool | None = None,
@@ -399,11 +420,14 @@ def _hf_convert_weights(
         our_key = _hf_key_to_ours(
             hf_key,
             num_layers,
+            has_moe=has_moe,
             has_vision=has_vision,
             has_audio=has_audio,
             use_clipped_vision=use_clipped_vision,
         )
         if our_key is not None:
+            if hf_key.endswith(".experts.down_proj") or hf_key.endswith(".experts.gate_up_proj"):
+                tensor = tensor.transpose(1, 2).contiguous()
             mapped[our_key] = tensor
         else:
             skipped.append(hf_key)
@@ -416,7 +440,8 @@ def _hf_convert_weights(
             skipped.append(f"layers.{layer_idx}.mlp.gate_proj.weight (missing up_proj)")
             continue
         fused = torch.cat([gate, up], dim=0)
-        our_key = f"text_decoder.blocks.{layer_idx}.ffw.gate_up_proj.weight"
+        ffw_prefix = "mlp2" if has_moe else "ffw"
+        our_key = f"text_decoder.blocks.{layer_idx}.{ffw_prefix}.gate_up_proj.weight"
         mapped[our_key] = fused
 
     if skipped:
@@ -499,11 +524,13 @@ def load_weights(
 
     if format == "hf":
         num_layers = model.cfg.text.num_layers
+        has_moe = model.cfg.text.moe is not None
         has_vision = model.vision_encoder is not None
         has_audio = model.audio_encoder is not None
         raw = _hf_convert_weights(
             raw,
             num_layers,
+            has_moe=has_moe,
             has_vision=has_vision,
             has_audio=has_audio,
             use_clipped_vision=(

@@ -99,6 +99,45 @@ class TestHFKeyMapping:
             "model.language_model.layers.0.post_per_layer_input_norm.weight", 4
         ) == "text_decoder.blocks.0.pli_mapping.norm.weight"
 
+    def test_moe_dense_branch_mapping(self):
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.mlp.down_proj.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.mlp2.down_proj.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.mlp.gate_up_proj.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.mlp2.gate_up_proj.weight"
+
+    def test_moe_router_and_expert_mapping(self):
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.router.proj.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.moe.router.gate.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.router.scale", 4, has_moe=True
+        ) == "text_decoder.blocks.0.moe.router.router_scale"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.router.per_expert_scale", 4, has_moe=True
+        ) == "text_decoder.blocks.0.moe.experts.per_expert_scale"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.experts.gate_up_proj", 4, has_moe=True
+        ) == "text_decoder.blocks.0.moe.experts.gate_up"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.experts.down_proj", 4, has_moe=True
+        ) == "text_decoder.blocks.0.moe.experts.down"
+
+    def test_moe_norm_mapping(self):
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.pre_feedforward_layernorm.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.pre_ffw2_norm.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.pre_feedforward_layernorm_2.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.pre_ffw_norm.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.post_feedforward_layernorm_1.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.post_ffw2_norm.weight"
+        assert _hf_key_to_ours(
+            "model.language_model.layers.0.post_feedforward_layernorm_2.weight", 4, has_moe=True
+        ) == "text_decoder.blocks.0.post_ffw1_norm.weight"
+
 
 class TestHFConvertWeights:
     def test_gate_up_merge(self):
@@ -113,6 +152,43 @@ class TestHFConvertWeights:
         assert fused.shape == (8, 2)
         assert torch.equal(fused[:4], raw["model.language_model.layers.0.mlp.gate_proj.weight"])
         assert torch.equal(fused[4:], raw["model.language_model.layers.0.mlp.up_proj.weight"])
+
+    def test_moe_paths_and_transposes(self):
+        raw = {
+            "model.language_model.layers.0.mlp.gate_proj.weight": torch.randn(4, 2),
+            "model.language_model.layers.0.mlp.up_proj.weight": torch.randn(4, 2),
+            "model.language_model.layers.0.mlp.down_proj.weight": torch.randn(2, 4),
+            "model.language_model.layers.0.experts.gate_up_proj": torch.randn(3, 8, 2),
+            "model.language_model.layers.0.experts.down_proj": torch.randn(3, 2, 8),
+            "model.language_model.layers.0.router.proj.weight": torch.randn(3, 2),
+            "model.language_model.layers.0.router.scale": torch.randn(2),
+            "model.language_model.layers.0.router.per_expert_scale": torch.randn(3),
+            "model.language_model.layers.0.pre_feedforward_layernorm.weight": torch.randn(2),
+            "model.language_model.layers.0.pre_feedforward_layernorm_2.weight": torch.randn(2),
+            "model.language_model.layers.0.post_feedforward_layernorm_1.weight": torch.randn(2),
+            "model.language_model.layers.0.post_feedforward_layernorm_2.weight": torch.randn(2),
+        }
+        mapped = _hf_convert_weights(raw, num_layers=1, has_moe=True)
+
+        assert "text_decoder.blocks.0.mlp2.gate_up_proj.weight" in mapped
+        assert "text_decoder.blocks.0.mlp2.down_proj.weight" in mapped
+        assert "text_decoder.blocks.0.moe.router.gate.weight" in mapped
+        assert "text_decoder.blocks.0.moe.router.router_scale" in mapped
+        assert "text_decoder.blocks.0.moe.experts.per_expert_scale" in mapped
+        assert "text_decoder.blocks.0.pre_ffw_norm.weight" in mapped
+        assert "text_decoder.blocks.0.pre_ffw2_norm.weight" in mapped
+        assert "text_decoder.blocks.0.post_ffw1_norm.weight" in mapped
+        assert "text_decoder.blocks.0.post_ffw2_norm.weight" in mapped
+
+        fused = mapped["text_decoder.blocks.0.mlp2.gate_up_proj.weight"]
+        assert fused.shape == (8, 2)
+        assert torch.equal(fused[:4], raw["model.language_model.layers.0.mlp.gate_proj.weight"])
+        assert torch.equal(fused[4:], raw["model.language_model.layers.0.mlp.up_proj.weight"])
+
+        expected_gate_up = raw["model.language_model.layers.0.experts.gate_up_proj"].transpose(1, 2).contiguous()
+        expected_down = raw["model.language_model.layers.0.experts.down_proj"].transpose(1, 2).contiguous()
+        assert torch.equal(mapped["text_decoder.blocks.0.moe.experts.gate_up"], expected_gate_up)
+        assert torch.equal(mapped["text_decoder.blocks.0.moe.experts.down"], expected_down)
 
 
 class TestLoadWeights:
