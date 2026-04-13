@@ -54,7 +54,7 @@ from .factory import gemma4_e2b, gemma4_e4b, gemma4_31b, gemma4_26b_a4b
 from .tokenizer import Gemma4Tokenizer
 
 # Weight loading
-from .load import load_weights
+from .load import load_weights, load_weights_streaming
 
 # Version
 from .version import __version__
@@ -127,6 +127,7 @@ __all__ = [
     "Gemma4Tokenizer",
     # Weight loading
     "load_weights",
+    "load_weights_streaming",
     # Version
     "__version__",
 ]

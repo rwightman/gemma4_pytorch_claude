@@ -7,10 +7,11 @@ import torch
 import pytest
 from safetensors.torch import save_file
 
-from gemma4_pt_claude.config import AttentionType, AudioConfig, Gemma4Config, TextConfig
+from gemma4_pt_claude.config import AttentionType, AudioConfig, Gemma4Config, MoEConfig, TextConfig
 from gemma4_pt_claude.model import Gemma4Model
 from gemma4_pt_claude.load import (
     load_weights,
+    load_weights_streaming,
     _hf_key_to_ours,
     _hf_convert_weights,
     _hf_vision_key_to_ours,
@@ -231,6 +232,32 @@ class TestLoadWeights:
         cfg = self._runtime_buffer_config()
         return Gemma4Model(cfg)
 
+    @staticmethod
+    def _runtime_moe_config() -> Gemma4Config:
+        text = TextConfig(
+            vocab_size=32,
+            embed_dim=16,
+            hidden_dim=12,
+            num_heads=2,
+            head_dim=8,
+            num_kv_heads=2,
+            num_layers=1,
+            sliding_window_size=8,
+            attention_pattern=(AttentionType.GLOBAL,),
+            use_qk_norm=False,
+            use_value_norm=False,
+            use_post_attn_norm=False,
+            use_post_ffw_norm=True,
+            per_layer_input_dim=0,
+            moe=MoEConfig(
+                num_experts=4,
+                top_k=2,
+                expert_dim=6,
+                dense_hidden_dim=12,
+            ),
+        )
+        return Gemma4Config(text=text)
+
     def test_load_our_format(self, tiny_model):
         """Save and reload in our native format."""
         state = tiny_model.state_dict()
@@ -294,6 +321,104 @@ class TestLoadWeights:
         assert isinstance(meta_model.text_decoder.embedder.pli_proj_scale, float)
         assert meta_model.text_decoder.embedder.pli_proj_scale > 0.0
         assert not meta_model.audio_encoder.conformer[0].attn.attn.local_causal_mask.is_meta
+
+    def test_load_streaming_meta_model_rebuilds_runtime_buffers(self):
+        cfg = self._runtime_buffer_config(with_audio=True)
+        reference = Gemma4Model(cfg)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.safetensors"
+            save_file(reference.state_dict(), str(path))
+            with torch.device("meta"):
+                meta_model = Gemma4Model(cfg)
+            missing, unexpected = load_weights_streaming(meta_model, path, device="cpu")
+
+        assert missing == []
+        assert unexpected == []
+        assert not meta_model.text_decoder.embedder.token_embedding.weight.is_meta
+        assert isinstance(meta_model.text_decoder.embedder.pli_proj_scale, float)
+        assert meta_model.text_decoder.embedder.pli_proj_scale > 0.0
+        assert not meta_model.audio_encoder.conformer[0].attn.attn.local_causal_mask.is_meta
+
+    def test_streaming_hf_dense_merge(self):
+        cfg = self._runtime_buffer_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.safetensors"
+            gate = torch.randn(32, 16)
+            up = torch.randn(32, 16)
+            down = torch.randn(16, 32)
+            save_file({
+                "model.language_model.layers.0.mlp.gate_proj.weight": gate,
+                "model.language_model.layers.0.mlp.up_proj.weight": up,
+                "model.language_model.layers.0.mlp.down_proj.weight": down,
+            }, str(path))
+
+            with torch.device("meta"):
+                meta_model = Gemma4Model(cfg)
+            missing, unexpected = load_weights_streaming(meta_model, path, format="hf", device="cpu")
+
+        assert unexpected == []
+        fused = meta_model.state_dict()["text_decoder.blocks.0.ffw.gate_up_proj.weight"]
+        assert torch.equal(fused[:32], gate)
+        assert torch.equal(fused[32:], up)
+        assert torch.equal(meta_model.state_dict()["text_decoder.blocks.0.ffw.down_proj.weight"], down)
+        assert "text_decoder.blocks.0.ffw.gate_up_proj.weight" not in missing
+        assert "text_decoder.blocks.0.ffw.down_proj.weight" not in missing
+
+    def test_streaming_hf_moe_mapping(self):
+        cfg = self._runtime_moe_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.safetensors"
+            gate = torch.randn(12, 16)
+            up = torch.randn(12, 16)
+            down = torch.randn(16, 12)
+            moe_gate_up = torch.randn(4, 12, 16)
+            moe_down = torch.randn(4, 16, 6)
+            router = torch.randn(4, 16)
+            router_scale = torch.randn(16)
+            per_expert_scale = torch.randn(4)
+            pre_ffw = torch.randn(16)
+            pre_ffw2 = torch.randn(16)
+            post_ffw1 = torch.randn(16)
+            post_ffw2 = torch.randn(16)
+            post_ffw = torch.randn(16)
+            save_file({
+                "model.language_model.layers.0.mlp.gate_proj.weight": gate,
+                "model.language_model.layers.0.mlp.up_proj.weight": up,
+                "model.language_model.layers.0.mlp.down_proj.weight": down,
+                "model.language_model.layers.0.experts.gate_up_proj": moe_gate_up,
+                "model.language_model.layers.0.experts.down_proj": moe_down,
+                "model.language_model.layers.0.router.proj.weight": router,
+                "model.language_model.layers.0.router.scale": router_scale,
+                "model.language_model.layers.0.router.per_expert_scale": per_expert_scale,
+                "model.language_model.layers.0.pre_feedforward_layernorm.weight": pre_ffw2,
+                "model.language_model.layers.0.pre_feedforward_layernorm_2.weight": pre_ffw,
+                "model.language_model.layers.0.post_feedforward_layernorm_1.weight": post_ffw2,
+                "model.language_model.layers.0.post_feedforward_layernorm_2.weight": post_ffw1,
+                "model.language_model.layers.0.post_feedforward_layernorm.weight": post_ffw,
+            }, str(path))
+
+            with torch.device("meta"):
+                meta_model = Gemma4Model(cfg)
+            missing, unexpected = load_weights_streaming(meta_model, path, format="hf", device="cpu")
+
+        assert unexpected == []
+        sd = meta_model.state_dict()
+        assert torch.equal(sd["text_decoder.blocks.0.mlp2.gate_up_proj.weight"][:12], gate)
+        assert torch.equal(sd["text_decoder.blocks.0.mlp2.gate_up_proj.weight"][12:], up)
+        assert torch.equal(sd["text_decoder.blocks.0.mlp2.down_proj.weight"], down)
+        assert torch.equal(sd["text_decoder.blocks.0.moe.router.gate.weight"], router)
+        assert torch.equal(sd["text_decoder.blocks.0.moe.router.router_scale"], router_scale)
+        assert torch.equal(sd["text_decoder.blocks.0.moe.experts.per_expert_scale"], per_expert_scale)
+        assert torch.equal(sd["text_decoder.blocks.0.moe.experts.gate_up"], moe_gate_up.transpose(1, 2))
+        assert torch.equal(sd["text_decoder.blocks.0.moe.experts.down"], moe_down.transpose(1, 2))
+        assert torch.equal(sd["text_decoder.blocks.0.pre_ffw_norm.weight"], pre_ffw)
+        assert torch.equal(sd["text_decoder.blocks.0.pre_ffw2_norm.weight"], pre_ffw2)
+        assert torch.equal(sd["text_decoder.blocks.0.post_ffw1_norm.weight"], post_ffw1)
+        assert torch.equal(sd["text_decoder.blocks.0.post_ffw2_norm.weight"], post_ffw2)
+        assert torch.equal(sd["text_decoder.blocks.0.post_ffw_norm.weight"], post_ffw)
+        assert "text_decoder.blocks.0.moe.router.gate.weight" not in missing
+        assert "text_decoder.blocks.0.moe.experts.gate_up" not in missing
 
     def test_materialize_initializes_meta_model_and_runtime_buffers(self):
         cfg = self._runtime_buffer_config(with_audio=True)

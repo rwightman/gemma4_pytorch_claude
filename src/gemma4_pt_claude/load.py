@@ -17,7 +17,6 @@ Usage::
 from __future__ import annotations
 
 from pathlib import Path
-
 import torch
 from safetensors import safe_open
 
@@ -452,22 +451,208 @@ def _hf_convert_weights(
 
 def _load_safetensors_files(path: str | Path) -> dict[str, torch.Tensor]:
     """Load tensors from one or more safetensors files."""
-    p = Path(path)
-    if p.is_file():
-        files = [p]
-    elif p.is_dir():
-        files = sorted(p.glob("*.safetensors"))
-        if not files:
-            raise FileNotFoundError(f"No .safetensors files found in {p}")
-    else:
-        raise FileNotFoundError(f"Path does not exist: {p}")
-
+    files = _iter_safetensors_files(path)
     tensors: dict[str, torch.Tensor] = {}
     for f in files:
         with safe_open(str(f), framework="pt", device="cpu") as sf:
             for key in sf.keys():
                 tensors[key] = sf.get_tensor(key)
     return tensors
+
+
+def _iter_safetensors_files(path: str | Path) -> list[Path]:
+    """Resolve a safetensors path into a deterministic file list."""
+    p = Path(path)
+    if p.is_file():
+        return [p]
+    if p.is_dir():
+        files = sorted(p.glob("*.safetensors"))
+        if not files:
+            raise FileNotFoundError(f"No .safetensors files found in {p}")
+        return files
+    raise FileNotFoundError(f"Path does not exist: {p}")
+
+
+def _detect_format_from_path(path: str | Path) -> str:
+    """Detect whether a safetensors checkpoint uses HF or native key naming."""
+    files = _iter_safetensors_files(path)
+    with safe_open(str(files[0]), framework="pt", device="cpu") as sf:
+        keys = list(sf.keys())
+    if not keys:
+        raise ValueError(f"No tensors found in {files[0]}.")
+    sample_key = keys[0]
+    if sample_key.startswith("model.") or sample_key.startswith("language_model."):
+        return "hf"
+    return "ours"
+
+
+def _remap_legacy_scale_key(
+        key: str,
+        expected_keys: set[str],
+) -> str:
+    if key.endswith(".scale"):
+        new_key = f"{key[:-len('.scale')]}.weight"
+        if new_key in expected_keys and key not in expected_keys:
+            return new_key
+    return key
+
+
+def _materialize_model_for_streaming_load(
+        model: Gemma4Model,
+        *,
+        dtype: torch.dtype | None,
+        device: str | torch.device | None,
+) -> None:
+    is_meta_model = any(param.is_meta for param in model.parameters()) or any(
+        buffer.is_meta for buffer in model.buffers()
+    )
+    if not is_meta_model:
+        return
+
+    if dtype is not None:
+        model.to(dtype=dtype)
+
+    target_device = torch.device("cpu") if device is None else torch.device(device)
+    model.to_empty(device=target_device)
+    model.init_non_persistent_buffers()
+
+
+def _copy_into_destination(
+        dest: torch.Tensor,
+        tensor: torch.Tensor,
+) -> None:
+    with torch.no_grad():
+        src = tensor.to(device=dest.device, dtype=dest.dtype)
+        dest.copy_(src)
+
+
+def _copy_mapped_tensor(
+        dest_tensors: dict[str, torch.Tensor],
+        missing: set[str],
+        key: str,
+        tensor: torch.Tensor,
+) -> None:
+    _copy_into_destination(dest_tensors[key], tensor)
+    missing.discard(key)
+
+
+def _stream_hf_weights_into_model(
+        model: Gemma4Model,
+        path: str | Path,
+        *,
+        dtype: torch.dtype | None = None,
+) -> tuple[list[str], list[str]]:
+    """Stream HF safetensors directly into model params/buffers."""
+    dest_tensors = model.state_dict(keep_vars=True)
+    expected_keys = set(dest_tensors.keys())
+    missing = set(expected_keys)
+    unexpected: list[str] = []
+    skipped: list[str] = []
+
+    num_layers = model.cfg.text.num_layers
+    has_moe = model.cfg.text.moe is not None
+    has_vision = model.vision_encoder is not None
+    has_audio = model.audio_encoder is not None
+    use_clipped_vision = (
+        model.cfg.vision.use_clipped_linear
+        if has_vision and model.cfg.vision is not None
+        else None
+    )
+
+    gate_projs: dict[str, torch.Tensor] = {}
+    up_projs: dict[str, torch.Tensor] = {}
+
+    for file_path in _iter_safetensors_files(path):
+        with safe_open(str(file_path), framework="pt", device="cpu") as sf:
+            for hf_key in sf.keys():
+                k = hf_key
+                if k.startswith("model.language_model."):
+                    k = k[len("model.language_model."):]
+                elif k.startswith("model."):
+                    k = k[len("model."):]
+
+                if k.startswith("layers.") and k.endswith(".mlp.gate_proj.weight"):
+                    layer_idx = k.split(".")[1]
+                    gate_projs[layer_idx] = sf.get_tensor(hf_key)
+                    continue
+                if k.startswith("layers.") and k.endswith(".mlp.up_proj.weight"):
+                    layer_idx = k.split(".")[1]
+                    up_projs[layer_idx] = sf.get_tensor(hf_key)
+                    continue
+
+                mapped_key = _hf_key_to_ours(
+                    hf_key,
+                    num_layers,
+                    has_moe=has_moe,
+                    has_vision=has_vision,
+                    has_audio=has_audio,
+                    use_clipped_vision=use_clipped_vision,
+                )
+                if mapped_key is None:
+                    skipped.append(hf_key)
+                    continue
+
+                mapped_key = _remap_legacy_scale_key(mapped_key, expected_keys)
+                if mapped_key not in dest_tensors:
+                    unexpected.append(hf_key)
+                    continue
+
+                tensor = sf.get_tensor(hf_key)
+                if hf_key.endswith(".experts.down_proj") or hf_key.endswith(".experts.gate_up_proj"):
+                    tensor = tensor.transpose(1, 2).contiguous()
+                if dtype is not None and torch.is_floating_point(tensor):
+                    tensor = tensor.to(dtype)
+                _copy_mapped_tensor(dest_tensors, missing, mapped_key, tensor)
+
+    ffw_prefix = "mlp2" if has_moe else "ffw"
+    for layer_idx, gate in gate_projs.items():
+        up = up_projs.get(layer_idx)
+        if up is None:
+            skipped.append(f"layers.{layer_idx}.mlp.gate_proj.weight (missing up_proj)")
+            continue
+        fused = torch.cat([gate, up], dim=0)
+        if dtype is not None and torch.is_floating_point(fused):
+            fused = fused.to(dtype)
+        mapped_key = f"text_decoder.blocks.{layer_idx}.{ffw_prefix}.gate_up_proj.weight"
+        mapped_key = _remap_legacy_scale_key(mapped_key, expected_keys)
+        if mapped_key not in dest_tensors:
+            unexpected.append(f"layers.{layer_idx}.mlp.gate_up_proj.weight")
+            continue
+        _copy_mapped_tensor(dest_tensors, missing, mapped_key, fused)
+
+    if skipped:
+        print(f"Skipped {len(skipped)} HF keys: {skipped[:10]}...")
+
+    model.init_non_persistent_buffers()
+    return sorted(missing), unexpected
+
+
+def _stream_native_weights_into_model(
+        model: Gemma4Model,
+        path: str | Path,
+        *,
+        dtype: torch.dtype | None = None,
+) -> tuple[list[str], list[str]]:
+    """Stream native-format safetensors directly into model params/buffers."""
+    dest_tensors = model.state_dict(keep_vars=True)
+    expected_keys = set(dest_tensors.keys())
+    missing = set(expected_keys)
+    unexpected: list[str] = []
+
+    for file_path in _iter_safetensors_files(path):
+        with safe_open(str(file_path), framework="pt", device="cpu") as sf:
+            for key in sf.keys():
+                mapped_key = _remap_legacy_scale_key(key, expected_keys)
+                if mapped_key not in dest_tensors:
+                    unexpected.append(key)
+                    continue
+                tensor = sf.get_tensor(key)
+                if dtype is not None and torch.is_floating_point(tensor):
+                    tensor = tensor.to(dtype)
+                _copy_mapped_tensor(dest_tensors, missing, mapped_key, tensor)
+
+    model.init_non_persistent_buffers()
+    return sorted(missing), unexpected
 
 
 def _remap_legacy_scale_keys(
@@ -488,6 +673,39 @@ def _remap_legacy_scale_keys(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def load_weights_streaming(
+        model: Gemma4Model,
+        path: str | Path,
+        *,
+        format: str = "auto",
+        strict: bool = False,
+        dtype: torch.dtype | None = None,
+        device: str | torch.device | None = None,
+) -> tuple[list[str], list[str]]:
+    """Stream safetensors directly into model params/buffers.
+
+    Unlike ``load_weights()``, this avoids building a full in-memory raw dict
+    and a second remapped dict before materializing the model.
+    """
+    if format == "auto":
+        format = _detect_format_from_path(path)
+
+    _materialize_model_for_streaming_load(model, dtype=dtype, device=device)
+
+    if format == "hf":
+        missing, unexpected = _stream_hf_weights_into_model(model, path, dtype=dtype)
+    elif format == "ours":
+        missing, unexpected = _stream_native_weights_into_model(model, path, dtype=dtype)
+    else:
+        raise ValueError(f"Unsupported format: {format}. Expected 'auto', 'hf', or 'ours'.")
+
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"Strict load failed with missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+
+    return missing, unexpected
 
 def load_weights(
         model: Gemma4Model,
