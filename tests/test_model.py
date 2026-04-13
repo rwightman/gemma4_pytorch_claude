@@ -20,6 +20,7 @@ from gemma4_pt_claude.model import (
     make_causal_bidirectional_mask,
 )
 from gemma4_pt_claude.generate import generate, init_cache
+from gemma4_pt_claude.module_utils import InitContext
 
 
 def _tiny_config() -> Gemma4Config:
@@ -129,6 +130,45 @@ class TestGemma4Model:
         assert model.text_decoder.blocks[1].attn.k_eq_v is True
         assert hasattr(model.text_decoder.blocks[0].attn, "v_proj")
         assert not hasattr(model.text_decoder.blocks[1].attn, "v_proj")
+
+    def test_constructor_init_context_matches_explicit_reinit(self):
+        cfg = _tiny_config()
+        model_from_ctor = Gemma4Model(
+            cfg,
+            init_context=InitContext(generator=torch.Generator(device="cpu").manual_seed(0)),
+        )
+        model_manual = Gemma4Model(cfg)
+        model_manual.init_weights(InitContext(generator=torch.Generator(device="cpu").manual_seed(0)))
+
+        for key, value in model_from_ctor.state_dict().items():
+            other = model_manual.state_dict()[key]
+            if torch.is_floating_point(value):
+                torch.testing.assert_close(value, other)
+            else:
+                assert torch.equal(value, other)
+
+    def test_materialize_init_context_matches_manual_meta_init(self):
+        cfg = _tiny_config()
+        with torch.device("meta"):
+            from_materialize = Gemma4Model(cfg)
+        from_materialize.materialize(
+            device="cpu",
+            dtype=torch.float32,
+            init_weights=True,
+            init_context=InitContext(generator=torch.Generator(device="cpu").manual_seed(0)),
+        )
+
+        with torch.device("meta"):
+            manual = Gemma4Model(cfg)
+        manual.materialize(device="cpu", dtype=torch.float32, init_weights=False)
+        manual.init_weights(InitContext(generator=torch.Generator(device="cpu").manual_seed(0)))
+
+        for key, value in from_materialize.state_dict().items():
+            other = manual.state_dict()[key]
+            if torch.is_floating_point(value):
+                torch.testing.assert_close(value, other)
+            else:
+                assert torch.equal(value, other)
 
 
 class TestCacheValidMask:

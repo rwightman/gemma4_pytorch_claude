@@ -222,6 +222,7 @@ class Gemma4Model(InitModule):
             *,
             device: torch.device | str | None = None,
             dtype: torch.dtype | None = None,
+            init_context: InitContext | None = None,
     ):
         super().__init__()
         dd = factory_kwargs(device, dtype)
@@ -250,7 +251,7 @@ class Gemma4Model(InitModule):
             )
 
         if not any(param.is_meta for param in self.parameters()):
-            self.init_weights()
+            self.init_weights(init_context)
 
     def _init_non_persistent_buffers(self) -> None:
         return
@@ -261,7 +262,7 @@ class Gemma4Model(InitModule):
             device: torch.device | str,
             dtype: torch.dtype | None = None,
             init_weights: bool = True,
-            ctx: InitContext | None = None,
+            init_context: InitContext | None = None,
     ) -> "Gemma4Model":
         target_device = torch.device(device)
         if any(param.device.type == "meta" for param in self.parameters()):
@@ -271,7 +272,7 @@ class Gemma4Model(InitModule):
         else:
             self.to(device=target_device, dtype=dtype)
         if init_weights:
-            self.init_weights(ctx)
+            self.init_weights(init_context)
         else:
             self.init_non_persistent_buffers()
         return self

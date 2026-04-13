@@ -84,7 +84,7 @@ class RelativePositionEmbedding(InitModule):
         return bd.reshape(B, N, U, W, key_ctx)
 
     def _init_weights(self, ctx) -> None:
-        nn.init.xavier_uniform_(self.pos_proj.weight)
+        nn.init.xavier_uniform_(self.pos_proj.weight, generator=ctx.generator)
         if self.pos_proj.bias is not None:
             nn.init.zeros_(self.pos_proj.bias)
         self._init_non_persistent_buffers()

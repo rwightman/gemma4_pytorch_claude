@@ -15,6 +15,7 @@ from .config import (
     TextConfig,
     VisionConfig,
 )
+from .module_utils import InitContext
 from .model import Gemma4Model
 
 # Common attention pattern for Gemma4 (4:1 local:global)
@@ -97,6 +98,7 @@ def gemma4_e2b(
         *,
         device: str | None = None,
         dtype=None,
+        init_context: InitContext | None = None,
 ) -> Gemma4Model:
     """Gemma4 E2B: 35 layers, embed=1536, 8H/1KV, 4:1 pattern, sw=512, pli=256."""
     num_layers = 35
@@ -134,7 +136,7 @@ def gemma4_e2b(
         vision=None if text_only else _e2b_e4b_vision(embed_dim),
         audio=None if text_only else _default_audio(),
     )
-    return Gemma4Model(cfg, device=device, dtype=dtype)
+    return Gemma4Model(cfg, device=device, dtype=dtype, init_context=init_context)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +148,7 @@ def gemma4_e4b(
         *,
         device: str | None = None,
         dtype=None,
+        init_context: InitContext | None = None,
 ) -> Gemma4Model:
     """Gemma4 E4B: 42 layers, embed=2560, 8H/2KV, 5:1 pattern, sw=512, pli=256."""
     num_layers = 42
@@ -182,7 +185,7 @@ def gemma4_e4b(
         vision=None if text_only else _e2b_e4b_vision(embed_dim),
         audio=None if text_only else _default_audio(),
     )
-    return Gemma4Model(cfg, device=device, dtype=dtype)
+    return Gemma4Model(cfg, device=device, dtype=dtype, init_context=init_context)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +197,7 @@ def gemma4_31b(
         *,
         device: str | None = None,
         dtype=None,
+        init_context: InitContext | None = None,
 ) -> Gemma4Model:
     """Gemma4 31B: 60 layers, embed=5376, 32H/16KV(4 global KV), 5:1, sw=1024."""
     num_layers = 60
@@ -226,7 +230,7 @@ def gemma4_31b(
         text=text,
         vision=None if text_only else _large_vision(embed_dim),
     )
-    return Gemma4Model(cfg, device=device, dtype=dtype)
+    return Gemma4Model(cfg, device=device, dtype=dtype, init_context=init_context)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +242,7 @@ def gemma4_26b_a4b(
         *,
         device: str | None = None,
         dtype=None,
+        init_context: InitContext | None = None,
 ) -> Gemma4Model:
     """Gemma4 26B-A4B: 30 layers, embed=2816, 16H/8KV(2 global KV), 5:1, MoE."""
     num_layers = 30
@@ -276,4 +281,4 @@ def gemma4_26b_a4b(
         text=text,
         vision=None if text_only else _large_vision(embed_dim),
     )
-    return Gemma4Model(cfg, device=device, dtype=dtype)
+    return Gemma4Model(cfg, device=device, dtype=dtype, init_context=init_context)

@@ -40,6 +40,7 @@ from .composer import (
     AudioTransform,
     PreparedAudio,
 )
+from .module_utils import InitContext
 
 # Top-level model
 from .model import Gemma4Model, VisionEmbedder, AudioEmbedder
@@ -64,6 +65,7 @@ __all__ = [
     "AttentionType",
     "AudioConfig",
     "Gemma4Config",
+    "InitContext",
     "KVCacheSharingConfig",
     "MoEConfig",
     "TextConfig",
