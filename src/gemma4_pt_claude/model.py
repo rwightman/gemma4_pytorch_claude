@@ -9,25 +9,9 @@ import torch.nn.functional as F
 from .audio_encoder import AudioEncoder
 from .config import Gemma4Config
 from .layers import RMSNorm
+from .module_utils import InitContext, InitModule, factory_kwargs
 from .transformer import TextDecoder
 from .vision_encoder import VisionEncoder
-
-
-# ---------------------------------------------------------------------------
-# Runtime-only buffer init
-# ---------------------------------------------------------------------------
-
-def _run_non_persistent_buffer_init(module: nn.Module) -> None:
-    """Rebuild runtime-only buffers on child modules that opt into it."""
-    for submodule in module.modules():
-        if submodule is module:
-            continue
-        init_method = type(submodule).__dict__.get("init_non_persistent_buffers")
-        if init_method is None:
-            continue
-        init_method(submodule)
-
-
 # ---------------------------------------------------------------------------
 # Mask helpers
 # ---------------------------------------------------------------------------
@@ -161,66 +145,139 @@ def flatten_multimodal_tokens(
 # Multimodal Embedders
 # ---------------------------------------------------------------------------
 
-class VisionEmbedder(nn.Module):
+class VisionEmbedder(InitModule):
     """Vision: RMSNorm → Linear projection (norm before projection)."""
 
-    def __init__(self, mm_dim: int, text_dim: int, eps: float = 1e-6):
+    def __init__(
+            self,
+            mm_dim: int,
+            text_dim: int,
+            init_std: float,
+            eps: float = 1e-6,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.norm = RMSNorm(mm_dim, with_scale=False, eps=eps)
-        self.proj = nn.Linear(mm_dim, text_dim, bias=False)
+        self.init_std = init_std
+        dd = factory_kwargs(device, dtype)
+        self.norm = RMSNorm(mm_dim, with_scale=False, eps=eps, **dd)
+        self.proj = nn.Linear(mm_dim, text_dim, bias=False, **dd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.norm(x))
 
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        if self.norm.weight is not None:
+            nn.init.ones_(self.norm.weight)
 
-class AudioEmbedder(nn.Module):
+
+class AudioEmbedder(InitModule):
     """Audio: RMSNorm → Linear projection (norm before projection)."""
 
-    def __init__(self, mm_dim: int, text_dim: int, eps: float = 1e-6):
+    def __init__(
+            self,
+            mm_dim: int,
+            text_dim: int,
+            init_std: float,
+            eps: float = 1e-6,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.norm = RMSNorm(mm_dim, with_scale=False, eps=eps)
-        self.proj = nn.Linear(mm_dim, text_dim, bias=False)
+        self.init_std = init_std
+        dd = factory_kwargs(device, dtype)
+        self.norm = RMSNorm(mm_dim, with_scale=False, eps=eps, **dd)
+        self.proj = nn.Linear(mm_dim, text_dim, bias=False, **dd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.norm(x))
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        if self.norm.weight is not None:
+            nn.init.ones_(self.norm.weight)
 
 
 # ---------------------------------------------------------------------------
 # Gemma4Model
 # ---------------------------------------------------------------------------
 
-class Gemma4Model(nn.Module):
+class Gemma4Model(InitModule):
     """Top-level Gemma4 model.
 
     Architecture: text_decoder, vision_encoder, audio_encoder as peers.
     Vision/audio encoders are optional and fully standalone.
     """
 
-    def __init__(self, cfg: Gemma4Config):
+    def __init__(
+            self,
+            cfg: Gemma4Config,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.cfg = cfg
-        self.text_decoder = TextDecoder(cfg.text)
+        self.text_decoder = TextDecoder(cfg.text, **dd)
 
         self.vision_encoder = None
         self.embed_vision = None
         if cfg.vision is not None:
-            self.vision_encoder = VisionEncoder(cfg.vision)
+            self.vision_encoder = VisionEncoder(cfg.vision, **dd)
             self.embed_vision = VisionEmbedder(
                 cfg.vision.d_model, cfg.vision.text_embed_dim,
+                init_std=cfg.text.init_std,
                 eps=cfg.vision.rms_norm_eps,
+                **dd,
             )
 
         self.audio_encoder = None
         self.embed_audio = None
         if cfg.audio is not None:
-            self.audio_encoder = AudioEncoder(cfg.audio)
+            self.audio_encoder = AudioEncoder(cfg.audio, **dd)
             self.embed_audio = AudioEmbedder(
                 cfg.audio.lm_model_dims, cfg.text.embed_dim,
+                init_std=cfg.text.init_std,
+                **dd,
             )
 
-    def init_non_persistent_buffers(self) -> None:
-        """Rebuild runtime-only buffers after meta-init or state-dict assignment."""
-        _run_non_persistent_buffer_init(self)
+        if not any(param.is_meta for param in self.parameters()):
+            self.init_weights()
+
+    def _init_non_persistent_buffers(self) -> None:
+        return
+
+    def materialize(
+            self,
+            *,
+            device: torch.device | str,
+            dtype: torch.dtype | None = None,
+            init_weights: bool = True,
+            ctx: InitContext | None = None,
+    ) -> "Gemma4Model":
+        target_device = torch.device(device)
+        if any(param.device.type == "meta" for param in self.parameters()):
+            if dtype is not None:
+                self.to(dtype=dtype)
+            self.to_empty(device=target_device)
+        else:
+            self.to(device=target_device, dtype=dtype)
+        if init_weights:
+            self.init_weights(ctx)
+        else:
+            self.init_non_persistent_buffers()
+        return self
+
+    def _init_weights(self, ctx) -> None:
+        return
 
     def forward(
             self,

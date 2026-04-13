@@ -7,24 +7,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import RMSNorm, TanhGELU
+from .module_utils import InitModule, factory_kwargs
 
 
-class MoERouter(nn.Module):
+class MoERouter(InitModule):
     """Top-k softmax router.
 
     JAX reference: norm(x) * (rsqrt(features) * router_scale) -> linear -> softmax -> topk -> renorm.
     ``router_scale`` is a *per-feature* learned parameter (init ones).
     """
 
-    def __init__(self, features: int, num_experts: int, top_k: int):
+    def __init__(
+            self,
+            features: int,
+            num_experts: int,
+            top_k: int,
+            init_std: float,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.features = features
         self.top_k = top_k
         self.num_experts = num_experts
-        self.norm = RMSNorm(features, with_scale=False)
-        self.gate = nn.Linear(features, num_experts, bias=False)
+        self.init_std = init_std
+        dd = factory_kwargs(device, dtype)
+        self.norm = RMSNorm(features, with_scale=False, **dd)
+        self.gate = nn.Linear(features, num_experts, bias=False, **dd)
         # Per-feature learned router scale (init ones), times rsqrt(features)
-        self.router_scale = nn.Parameter(torch.ones(features))
+        self.router_scale = nn.Parameter(torch.ones(features, **dd))
         self.root_size = self._build_root_size()
 
     def _build_root_size(self) -> float:
@@ -41,30 +53,49 @@ class MoERouter(nn.Module):
         topk_weights = topk_weights / denom
         return topk_weights.to(x.dtype), topk_idx
 
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.gate.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.gate.bias is not None:
+            nn.init.zeros_(self.gate.bias)
+        nn.init.ones_(self.router_scale)
 
-class MoEExperts(nn.Module):
+
+class MoEExperts(InitModule):
     """Batched expert GatedMLPs.
 
     Stores gate_up and down weights as ``[E, ...]`` tensors and dispatches
     tokens to the selected experts.  Includes per-expert learned scale.
     """
 
-    def __init__(self, num_experts: int, features: int, expert_dim: int):
+    def __init__(
+            self,
+            num_experts: int,
+            features: int,
+            expert_dim: int,
+            init_std: float,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.features = features
         self.expert_dim = expert_dim
+        self.init_std = init_std
+        self.residual_init_std = init_std if residual_init_std is None else residual_init_std
         # Each expert is a GatedMLP: gate_up [features -> 2*expert_dim], down [expert_dim -> features]
-        self.gate_up = nn.Parameter(torch.empty(num_experts, features, 2 * expert_dim))
-        self.down = nn.Parameter(torch.empty(num_experts, expert_dim, features))
+        dd = factory_kwargs(device, dtype)
+        self.gate_up = nn.Parameter(torch.empty(num_experts, features, 2 * expert_dim, **dd))
+        self.down = nn.Parameter(torch.empty(num_experts, expert_dim, features, **dd))
         # Per-expert scale (init ones)
-        self.per_expert_scale = nn.Parameter(torch.ones(num_experts))
-        self.act = TanhGELU()
-        self._init_weights()
+        self.per_expert_scale = nn.Parameter(torch.ones(num_experts, **dd))
+        self.act = TanhGELU(**dd)
 
-    def _init_weights(self):
-        nn.init.kaiming_uniform_(self.gate_up)
-        nn.init.kaiming_uniform_(self.down)
+    def _init_weights(self, ctx):
+        nn.init.normal_(self.gate_up, mean=0.0, std=self.init_std, generator=ctx.generator)
+        nn.init.normal_(self.down, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        nn.init.ones_(self.per_expert_scale)
 
     def forward(
             self,
@@ -115,7 +146,7 @@ class MoEExperts(nn.Module):
         return out.reshape(B, L, D)
 
 
-class MoELayer(nn.Module):
+class MoELayer(InitModule):
     """MoE layer: router -> expert dispatch (no dense branch).
 
     The dense branch lives in ``TransformerBlock`` alongside its own norms,
@@ -128,10 +159,23 @@ class MoELayer(nn.Module):
             num_experts: int,
             top_k: int,
             expert_dim: int,
+            init_std: float,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.router = MoERouter(features, num_experts, top_k)
-        self.experts = MoEExperts(num_experts, features, expert_dim)
+        dd = factory_kwargs(device, dtype)
+        self.router = MoERouter(features, num_experts, top_k, init_std=init_std, **dd)
+        self.experts = MoEExperts(
+            num_experts,
+            features,
+            expert_dim,
+            init_std=init_std,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weights, indices = self.router(x)

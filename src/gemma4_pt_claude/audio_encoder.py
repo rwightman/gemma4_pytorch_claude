@@ -14,25 +14,43 @@ import torch.nn.functional as F
 
 from .config import AudioConfig
 from .layers import ClippedLinear, RMSNorm
+from .module_utils import InitModule, factory_kwargs, resolve_residual_init_std
 
 
 # ---------------------------------------------------------------------------
 # Relative position embedding (TransformerXL style)
 # ---------------------------------------------------------------------------
 
-class RelativePositionEmbedding(nn.Module):
+class RelativePositionEmbedding(InitModule):
     """Sinusoidal relative position embedding + learned projection."""
 
-    def __init__(self, channels: int, num_heads: int, head_dim: int, max_backward: int, max_forward: int):
+    def __init__(
+            self,
+            channels: int,
+            num_heads: int,
+            head_dim: int,
+            max_backward: int,
+            max_forward: int,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
+        self.init_std = 1e-2
         self.channels = channels
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.max_backward = max_backward
         self.max_forward = max_forward
 
-        self.pos_proj = nn.Linear(channels, num_heads * head_dim, bias=False)
-        self.register_buffer("inv_timescales", self._build_inv_timescales(), persistent=False)
+        self.pos_proj = nn.Linear(channels, num_heads * head_dim, bias=False, **dd)
+        self.register_buffer(
+            "inv_timescales",
+            torch.empty(1, 1, channels // 2, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self._init_non_persistent_buffers()
 
     def _build_inv_timescales(self) -> torch.Tensor:
         min_timescale = 1.0
@@ -44,8 +62,13 @@ class RelativePositionEmbedding(nn.Module):
         )
         return inv_ts.float().unsqueeze(0).unsqueeze(0)
 
-    def init_non_persistent_buffers(self) -> None:
-        self.inv_timescales = self._build_inv_timescales()
+    def _init_non_persistent_buffers(self) -> None:
+        inv_timescales = self._build_inv_timescales()
+        if self.inv_timescales.is_meta or inv_timescales.is_meta:
+            self.inv_timescales = inv_timescales
+        else:
+            with torch.no_grad():
+                self.inv_timescales.copy_(inv_timescales)
 
     def _timing_signal(self, positions: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         pos = positions.float().unsqueeze(-1)
@@ -59,6 +82,12 @@ class RelativePositionEmbedding(nn.Module):
         bd = bd.reshape(B, N, U, W * (key_ctx + 1))
         bd = bd[:, :, :, : W * key_ctx]
         return bd.reshape(B, N, U, W, key_ctx)
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.xavier_uniform_(self.pos_proj.weight)
+        if self.pos_proj.bias is not None:
+            nn.init.zeros_(self.pos_proj.bias)
+        self._init_non_persistent_buffers()
 
     def forward(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         """
@@ -96,11 +125,19 @@ class RelativePositionEmbedding(nn.Module):
 # Chunked local attention
 # ---------------------------------------------------------------------------
 
-class ChunkedLocalAttention(nn.Module):
+class ChunkedLocalAttention(InitModule):
     """Conformer-style chunked local attention with per-dim query scaling."""
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
+        self.init_std = cfg.init_std
         self.hidden_size = cfg.hidden_size
         self.num_heads = cfg.num_heads
         self.head_dim = cfg.hidden_size // cfg.num_heads
@@ -109,20 +146,27 @@ class ChunkedLocalAttention(nn.Module):
         self.max_future = cfg.context_right
         self.context_size = self.chunk_size + self.max_past + self.max_future
         self.attn_logit_cap = cfg.attn_logit_cap
+        self.num_layers = cfg.num_layers
 
         self.rel_pos_emb = RelativePositionEmbedding(
             cfg.hidden_size, cfg.num_heads, self.head_dim,
             self.max_past, self.max_future,
+            **dd,
         )
-        self.per_dim_scale = nn.Parameter(torch.ones(self.head_dim))
+        self.per_dim_scale = nn.Parameter(torch.ones(self.head_dim, **dd))
 
-        self.q_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
-        self.k_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
-        self.v_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False)
+        self.q_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False, init_std=self.init_std, **dd)
+        self.k_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False, init_std=self.init_std, **dd)
+        self.v_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False, init_std=self.init_std, **dd)
 
         self.q_scale_base = self._build_q_scale_base()
         self.key_scale = self._build_key_scale()
-        self.register_buffer("local_causal_mask", self._build_causal_mask(), persistent=False)
+        self.register_buffer(
+            "local_causal_mask",
+            torch.empty(self.chunk_size, self.context_size, dtype=torch.bool, device=device),
+            persistent=False,
+        )
+        self._init_non_persistent_buffers()
 
     def _build_q_scale_base(self) -> float:
         r_softplus_0 = 1.0 / math.log(2.0)
@@ -144,8 +188,13 @@ class ChunkedLocalAttention(nn.Module):
         )
         return lower & upper
 
-    def init_non_persistent_buffers(self) -> None:
-        self.local_causal_mask = self._build_causal_mask()
+    def _init_non_persistent_buffers(self) -> None:
+        local_causal_mask = self._build_causal_mask()
+        if self.local_causal_mask.is_meta or local_causal_mask.is_meta:
+            self.local_causal_mask = local_causal_mask
+        else:
+            with torch.no_grad():
+                self.local_causal_mask.copy_(local_causal_mask)
 
     def _to_blocks(self, x: torch.Tensor) -> torch.Tensor:
         """``[B, T, ...]`` -> ``[B, U, W, ...]`` with padding."""
@@ -250,20 +299,32 @@ class ChunkedLocalAttention(nn.Module):
         ctx = ctx.reshape(B, -1, self.num_heads, self.head_dim)[:, :T]
         return ctx
 
+    def _init_weights(self, ctx) -> None:
+        self._init_non_persistent_buffers()
+        nn.init.ones_(self.per_dim_scale)
+
 
 # ---------------------------------------------------------------------------
 # SubSampling block (2 conv layers, 4x reduction)
 # ---------------------------------------------------------------------------
 
-class SubSamplingBlock(nn.Module):
+class SubSamplingBlock(InitModule):
     """Two Conv2d layers with LayerNorm + ReLU, then linear project.
 
     JAX uses symmetric ``padding=((1,1),(1,1))`` on both convolutions,
     equivalent to PyTorch ``padding=1``.
     """
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        self.num_layers = cfg.num_layers
+        self.init_std = cfg.init_std
         c1, c2 = cfg.sscp_channels
         k1, k2 = cfg.sscp_kernel_sizes
         s1, s2 = cfg.sscp_stride_sizes
@@ -271,8 +332,9 @@ class SubSamplingBlock(nn.Module):
         self.stride2 = s2
 
         # JAX: padding=((1,1),(1,1)) — symmetric on both axes
-        self.conv1 = nn.Conv2d(1, c1, kernel_size=k1, stride=s1, padding=1, bias=False)
-        self.conv2 = nn.Conv2d(c1, c2, kernel_size=k2, stride=s2, padding=1, bias=False)
+        dd = factory_kwargs(device, dtype)
+        self.conv1 = nn.Conv2d(1, c1, kernel_size=k1, stride=s1, padding=1, bias=False, **dd)
+        self.conv2 = nn.Conv2d(c1, c2, kernel_size=k2, stride=s2, padding=1, bias=False, **dd)
 
         # Calculate output freq dims for norm + linear sizing
         # With padding=1, kernel=3, stride=2: out = (in + 2*1 - 3)//2 + 1 = (in-1)//2 + 1
@@ -282,10 +344,29 @@ class SubSamplingBlock(nn.Module):
 
         # JAX uses nn.LayerNorm(use_bias=False, use_scale=True) on NHWC data.
         # Our Conv2d outputs NCHW, so we permute to NHWC for norm, then back.
-        self.norm1 = nn.LayerNorm(c1, bias=False)
-        self.norm2 = nn.LayerNorm(c2, bias=False)
+        self.norm1 = nn.LayerNorm(c1, bias=False, **dd)
+        self.norm2 = nn.LayerNorm(c2, bias=False, **dd)
 
-        self.proj = nn.Linear(c2 * f2, cfg.hidden_size, bias=False)
+        self.proj = nn.Linear(c2 * f2, cfg.hidden_size, bias=False, **dd)
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.conv1.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.conv1.bias is not None:
+            nn.init.zeros_(self.conv1.bias)
+        nn.init.normal_(self.conv2.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.conv2.bias is not None:
+            nn.init.zeros_(self.conv2.bias)
+        if self.norm1.weight is not None:
+            nn.init.ones_(self.norm1.weight)
+        if self.norm1.bias is not None:
+            nn.init.zeros_(self.norm1.bias)
+        if self.norm2.weight is not None:
+            nn.init.ones_(self.norm2.weight)
+        if self.norm2.bias is not None:
+            nn.init.zeros_(self.norm2.bias)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
 
     def _subsample_mask(
             self, mask: torch.Tensor, stride: tuple[int, int], T_out: int,
@@ -325,16 +406,33 @@ class SubSamplingBlock(nn.Module):
 # Conformer feed-forward block
 # ---------------------------------------------------------------------------
 
-class FFNBlock(nn.Module):
+class FFNBlock(InitModule):
     """Conformer FFN: clip -> norm -> linear(4x) -> swish -> linear -> clip -> norm -> residual * 0.5"""
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        self.init_std = cfg.init_std
+        self.residual_init_std = cfg.init_std if residual_init_std is None else residual_init_std
         self.gradient_clip = cfg.gradient_clipping
-        self.pre_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
-        self.up = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 4, bias=False)
-        self.down = ClippedLinear(cfg.hidden_size * 4, cfg.hidden_size, bias=False)
-        self.post_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
+        dd = factory_kwargs(device, dtype)
+        self.pre_norm = RMSNorm(cfg.hidden_size, **dd)
+        self.up = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 4, bias=False, init_std=self.init_std, **dd)
+        self.down = ClippedLinear(
+            cfg.hidden_size * 4,
+            cfg.hidden_size,
+            bias=False,
+            init_std=self.init_std,
+            residual_init_std=self.residual_init_std,
+            **dd,
+        )
+        self.post_norm = RMSNorm(cfg.hidden_size, **dd)
         self.residual_weight = cfg.residual_weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -347,28 +445,52 @@ class FFNBlock(nn.Module):
         x = self.post_norm(x)
         return residual + x * self.residual_weight
 
+    def _init_weights(self, ctx) -> None:
+        if self.pre_norm.weight is not None:
+            nn.init.ones_(self.pre_norm.weight)
+        if self.post_norm.weight is not None:
+            nn.init.ones_(self.post_norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # Lightweight conv block
 # ---------------------------------------------------------------------------
 
-class LightweightConvBlock(nn.Module):
+class LightweightConvBlock(InitModule):
     """RMSNorm -> linear(2x) -> GLU -> depthwise causal conv1d -> norm -> swish -> linear -> residual."""
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        self.init_std = cfg.init_std
+        self.residual_init_std = cfg.init_std if residual_init_std is None else residual_init_std
         self.gradient_clip = cfg.gradient_clipping
-        self.pre_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
-        self.linear_start = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 2, bias=False)
+        dd = factory_kwargs(device, dtype)
+        self.pre_norm = RMSNorm(cfg.hidden_size, **dd)
+        self.linear_start = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 2, bias=False, init_std=self.init_std, **dd)
         self.dwconv = nn.Conv1d(
             cfg.hidden_size, cfg.hidden_size,
             kernel_size=cfg.conv_kernel_size,
             stride=1, padding=0,
             groups=cfg.hidden_size, bias=False,
+            **dd,
         )
         self.causal_pad = cfg.conv_kernel_size - 1
-        self.conv_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
-        self.linear_end = ClippedLinear(cfg.hidden_size, cfg.hidden_size, bias=False)
+        self.conv_norm = RMSNorm(cfg.hidden_size, **dd)
+        self.linear_end = ClippedLinear(
+            cfg.hidden_size,
+            cfg.hidden_size,
+            bias=False,
+            init_std=self.init_std,
+            residual_init_std=self.residual_init_std,
+            **dd,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -384,21 +506,47 @@ class LightweightConvBlock(nn.Module):
         x = self.linear_end(x)
         return x + residual
 
+    def _init_weights(self, ctx) -> None:
+        if self.pre_norm.weight is not None:
+            nn.init.ones_(self.pre_norm.weight)
+        nn.init.normal_(self.dwconv.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.dwconv.bias is not None:
+            nn.init.zeros_(self.dwconv.bias)
+        if self.conv_norm.weight is not None:
+            nn.init.ones_(self.conv_norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # Conformer attention wrapper
 # ---------------------------------------------------------------------------
 
-class ConformerAttention(nn.Module):
+class ConformerAttention(InitModule):
     """Wraps chunked local attention with pre/post norms and O-projection."""
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        self.init_std = cfg.init_std
+        self.residual_init_std = cfg.init_std if residual_init_std is None else residual_init_std
         self.gradient_clip = cfg.gradient_clipping
-        self.pre_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
-        self.attn = ChunkedLocalAttention(cfg)
-        self.o_proj = ClippedLinear(cfg.hidden_size, cfg.hidden_size, bias=False)
-        self.post_norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
+        dd = factory_kwargs(device, dtype)
+        self.pre_norm = RMSNorm(cfg.hidden_size, **dd)
+        self.attn = ChunkedLocalAttention(cfg, **dd)
+        self.o_proj = ClippedLinear(
+            cfg.hidden_size,
+            cfg.hidden_size,
+            bias=False,
+            init_std=self.init_std,
+            residual_init_std=self.residual_init_std,
+            **dd,
+        )
+        self.post_norm = RMSNorm(cfg.hidden_size, **dd)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         residual = x
@@ -411,22 +559,57 @@ class ConformerAttention(nn.Module):
         ctx = torch.clamp(ctx, -self.gradient_clip, self.gradient_clip)
         return residual + self.post_norm(ctx)
 
+    def _init_weights(self, ctx) -> None:
+        if self.pre_norm.weight is not None:
+            nn.init.ones_(self.pre_norm.weight)
+        if self.post_norm.weight is not None:
+            nn.init.ones_(self.post_norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # ConformerLayer
 # ---------------------------------------------------------------------------
 
-class ConformerLayer(nn.Module):
+class ConformerLayer(InitModule):
     """FFN(0.5) -> Attn -> mask -> LConv -> FFN(0.5) -> clip -> RMSNorm."""
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.ffw_start = FFNBlock(cfg)
-        self.attn = ConformerAttention(cfg)
-        self.lconv = LightweightConvBlock(cfg)
-        self.ffw_end = FFNBlock(cfg)
+        dd = factory_kwargs(device, dtype)
+        residual_init_std = resolve_residual_init_std(
+            cfg.init_std,
+            cfg.residual_init_std,
+            cfg.use_depth_scaled_residual_init,
+            cfg.num_layers,
+        )
+        self.ffw_start = FFNBlock(
+            cfg,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.attn = ConformerAttention(
+            cfg,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.lconv = LightweightConvBlock(
+            cfg,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
+        self.ffw_end = FFNBlock(
+            cfg,
+            residual_init_std=residual_init_std,
+            **dd,
+        )
         self.gradient_clip = cfg.gradient_clipping
-        self.norm = RMSNorm(cfg.hidden_size, scale_plus_one=False)
+        self.norm = RMSNorm(cfg.hidden_size, **dd)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         x = self.ffw_start(x)
@@ -439,24 +622,36 @@ class ConformerLayer(nn.Module):
         x = torch.clamp(x, -self.gradient_clip, self.gradient_clip)
         return self.norm(x)
 
+    def _init_weights(self, ctx) -> None:
+        if self.norm.weight is not None:
+            nn.init.ones_(self.norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # AudioEncoder (standalone)
 # ---------------------------------------------------------------------------
 
-class AudioEncoder(nn.Module):
+class AudioEncoder(InitModule):
     """Full audio encoder: mel -> subsample -> conformer -> output projection.
 
     Projection from ``lm_model_dims`` to text embedding space lives in
     the model-level ``embed_audio`` (MultimodalEmbedder), not here.
     """
 
-    def __init__(self, cfg: AudioConfig):
+    def __init__(
+            self,
+            cfg: AudioConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.cfg = cfg
-        self.subsample = SubSamplingBlock(cfg)
-        self.conformer = nn.ModuleList([ConformerLayer(cfg) for _ in range(cfg.num_layers)])
-        self.output_proj = nn.Linear(cfg.hidden_size, cfg.lm_model_dims, bias=True)
+        self.init_std = cfg.init_std
+        self.subsample = SubSamplingBlock(cfg, **dd)
+        self.conformer = nn.ModuleList([ConformerLayer(cfg, **dd) for _ in range(cfg.num_layers)])
+        self.output_proj = nn.Linear(cfg.hidden_size, cfg.lm_model_dims, bias=True, **dd)
 
     def forward(
             self, mel: torch.Tensor, mel_mask: torch.Tensor,
@@ -481,3 +676,8 @@ class AudioEncoder(nn.Module):
         x = x * valid
 
         return x, mel_mask
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.output_proj.bias is not None:
+            nn.init.zeros_(self.output_proj.bias)

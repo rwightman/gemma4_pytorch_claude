@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .attention import Attention, LayerCache
 from .config import AttentionType, TextConfig, build_kv_sharing_patterns, make_attention_pattern
 from .layers import GatedMLP, RMSNorm, TanhGELU
+from .module_utils import InitModule, factory_kwargs, resolve_residual_init_std
 from .moe import MoELayer
 
 
@@ -18,33 +19,40 @@ from .moe import MoELayer
 # Embedder
 # ---------------------------------------------------------------------------
 
-class Embedder(nn.Module):
+class Embedder(InitModule):
     """Token embedding + optional per-layer-input embedding + tied logit decode."""
 
-    def __init__(self, cfg: TextConfig):
+    def __init__(
+            self,
+            cfg: TextConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        self.init_std = cfg.init_std
         self.embed_dim = cfg.embed_dim
         self.vocab_size = cfg.vocab_size
         self.embed_scale = math.sqrt(cfg.embed_dim)
 
-        self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.embed_dim)
+        dd = factory_kwargs(device, dtype)
+        self.token_embedding = nn.Embedding(cfg.vocab_size, cfg.embed_dim, **dd)
 
         # Per-layer input: small per-token-per-layer embedding
         self.per_layer_input_dim = cfg.per_layer_input_dim
+        self.pli_proj_scale = float(self.embed_dim) ** -0.5
+        self.pli_combine_scale = 1.0 / math.sqrt(2.0)
         if cfg.per_layer_input_dim > 0:
             num_layers = cfg.num_layers
-            self.pli_embedding = nn.Embedding(cfg.vocab_size, num_layers * cfg.per_layer_input_dim)
-            self.pli_proj = nn.Linear(cfg.embed_dim, num_layers * cfg.per_layer_input_dim, bias=False)
-            self.pli_proj_norm = RMSNorm(cfg.per_layer_input_dim, scale_plus_one=False)
+            self.pli_embedding = nn.Embedding(cfg.vocab_size, num_layers * cfg.per_layer_input_dim, **dd)
+            self.pli_proj = nn.Linear(cfg.embed_dim, num_layers * cfg.per_layer_input_dim, bias=False, **dd)
+            self.pli_proj_norm = RMSNorm(cfg.per_layer_input_dim, **dd)
             self.num_layers = num_layers
-            self.pli_proj_scale = self._build_pli_proj_scale()
-            self.pli_combine_scale = self._build_pli_combine_scale()
-
-    def _build_pli_proj_scale(self) -> float:
-        return float(self.embed_dim) ** -0.5
-
-    def _build_pli_combine_scale(self) -> float:
-        return 1.0 / math.sqrt(2.0)
+        else:
+            self.pli_embedding = None
+            self.pli_proj = None
+            self.pli_proj_norm = None
+            self.num_layers = 0
 
     def encode(self, tokens: torch.Tensor) -> torch.Tensor:
         """``[B, L] -> [B, L, D]`` with sqrt(D) scaling."""
@@ -55,7 +63,9 @@ class Embedder(nn.Module):
         return F.linear(x, self.token_embedding.weight)
 
     def encode_per_layer_input(
-            self, x: torch.Tensor, tokens: torch.Tensor,
+            self,
+            x: torch.Tensor,
+            tokens: torch.Tensor,
     ) -> torch.Tensor:
         """Compute per-layer inputs: ``[B, L, num_layers, pli_dim]``.
 
@@ -82,32 +92,68 @@ class Embedder(nn.Module):
 
         return (proj + emb) * self.pli_combine_scale
 
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.token_embedding.padding_idx is not None:
+            with torch.no_grad():
+                self.token_embedding.weight[self.token_embedding.padding_idx].zero_()
+        if self.pli_embedding is not None:
+            nn.init.normal_(self.pli_embedding.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.pli_proj is not None:
+            nn.init.normal_(self.pli_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.pli_proj.bias is not None:
+                nn.init.zeros_(self.pli_proj.bias)
+        if self.pli_proj_norm is not None and self.pli_proj_norm.weight is not None:
+            nn.init.ones_(self.pli_proj_norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # PerLayerMapping (within each block)
 # ---------------------------------------------------------------------------
 
-class PerLayerMapping(nn.Module):
+class PerLayerMapping(InitModule):
     """Gate + project per-layer input back to embed_dim."""
 
-    def __init__(self, embed_dim: int, pli_dim: int):
+    def __init__(
+            self,
+            embed_dim: int,
+            pli_dim: int,
+            init_std: float,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.gate = nn.Linear(embed_dim, pli_dim, bias=False)
-        self.act = TanhGELU()
-        self.proj = nn.Linear(pli_dim, embed_dim, bias=False)
-        self.norm = RMSNorm(embed_dim, scale_plus_one=False)
+        self.init_std = init_std
+        self.residual_init_std = init_std if residual_init_std is None else residual_init_std
+        dd = factory_kwargs(device, dtype)
+        self.gate = nn.Linear(embed_dim, pli_dim, bias=False, **dd)
+        self.act = TanhGELU(**dd)
+        self.proj = nn.Linear(pli_dim, embed_dim, bias=False, **dd)
+        self.norm = RMSNorm(embed_dim, **dd)
 
     def forward(self, x: torch.Tensor, pli: torch.Tensor) -> torch.Tensor:
         g = self.act(self.gate(x))
         out = self.proj(g * pli)
         return self.norm(out)
 
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.gate.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.gate.bias is not None:
+            nn.init.zeros_(self.gate.bias)
+        nn.init.normal_(self.proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+        if self.norm.weight is not None:
+            nn.init.ones_(self.norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # TransformerBlock
 # ---------------------------------------------------------------------------
 
-class TransformerBlock(nn.Module):
+class TransformerBlock(InitModule):
     """Single transformer block with optional MoE and per-layer-input."""
 
     def __init__(
@@ -119,6 +165,8 @@ class TransformerBlock(nn.Module):
             head_dim: int | None = None,
             num_kv_heads: int | None = None,
             hidden_dim: int | None = None,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -152,15 +200,24 @@ class TransformerBlock(nn.Module):
             if attn_type == AttentionType.LOCAL_SLIDING
             else cfg.k_eq_v_global
         )
+        residual_init_std = resolve_residual_init_std(
+            cfg.init_std,
+            cfg.residual_init_std,
+            cfg.use_depth_scaled_residual_init,
+            cfg.num_layers,
+        )
 
         # Pre/post attention norms
-        self.pre_attn_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
+        dd = factory_kwargs(device, dtype)
+        self.pre_attn_norm = RMSNorm(cfg.embed_dim, **dd)
         self.attn = Attention(
             embed_dim=cfg.embed_dim,
             num_heads=cfg.num_heads,
             num_kv_heads=effective_kv_heads,
             head_dim=effective_head_dim,
             attn_type=attn_type,
+            init_std=cfg.init_std,
+            residual_init_std=residual_init_std,
             rope_base=rope_base,
             rope_scale_factor=rope_scale,
             rope_proportion=rope_prop,
@@ -170,14 +227,15 @@ class TransformerBlock(nn.Module):
             use_value_norm=cfg.use_value_norm,
             k_eq_v=k_eq_v,
             attn_impl=cfg.attn_impl,
+            **dd,
         )
         self.post_attn_norm = (
-            RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_attn_norm else None
+            RMSNorm(cfg.embed_dim, **dd) if cfg.use_post_attn_norm else None
         )
 
         # Feed-forward
         self.is_moe = cfg.moe is not None
-        self.pre_ffw_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
+        self.pre_ffw_norm = RMSNorm(cfg.embed_dim, **dd)
         if self.is_moe:
             # MoE branch: router + experts only (no dense inside MoELayer)
             self.moe = MoELayer(
@@ -185,35 +243,56 @@ class TransformerBlock(nn.Module):
                 num_experts=cfg.moe.num_experts,
                 top_k=cfg.moe.top_k,
                 expert_dim=cfg.moe.expert_dim,
+                init_std=cfg.init_std,
+                residual_init_std=residual_init_std,
+                **dd,
             )
             self.post_ffw1_norm = (
-                RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
+                RMSNorm(cfg.embed_dim, **dd) if cfg.use_post_ffw_norm else None
             )
             # Dense branch (parallel to MoE)
             dense_hid = cfg.moe.dense_hidden_dim if cfg.moe.dense_hidden_dim > 0 else effective_hidden
-            self.pre_ffw2_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
-            self.mlp2 = GatedMLP(cfg.embed_dim, dense_hid)
+            self.pre_ffw2_norm = RMSNorm(cfg.embed_dim, **dd)
+            self.mlp2 = GatedMLP(
+                cfg.embed_dim,
+                dense_hid,
+                init_std=cfg.init_std,
+                residual_init_std=residual_init_std,
+                **dd,
+            )
             self.post_ffw2_norm = (
-                RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
+                RMSNorm(cfg.embed_dim, **dd) if cfg.use_post_ffw_norm else None
             )
             # Combined post-norm
             self.post_ffw_norm = (
-                RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
+                RMSNorm(cfg.embed_dim, **dd) if cfg.use_post_ffw_norm else None
             )
         else:
-            self.ffw = GatedMLP(cfg.embed_dim, effective_hidden)
+            self.ffw = GatedMLP(
+                cfg.embed_dim,
+                effective_hidden,
+                init_std=cfg.init_std,
+                residual_init_std=residual_init_std,
+                **dd,
+            )
             self.post_ffw_norm = (
-                RMSNorm(cfg.embed_dim, scale_plus_one=False) if cfg.use_post_ffw_norm else None
+                RMSNorm(cfg.embed_dim, **dd) if cfg.use_post_ffw_norm else None
             )
 
         # Per-layer input
         if cfg.per_layer_input_dim > 0:
-            self.pli_mapping = PerLayerMapping(cfg.embed_dim, cfg.per_layer_input_dim)
+            self.pli_mapping = PerLayerMapping(
+                cfg.embed_dim,
+                cfg.per_layer_input_dim,
+                init_std=cfg.init_std,
+                residual_init_std=residual_init_std,
+                **dd,
+            )
         else:
             self.pli_mapping = None
 
         # Skip scale: scalar learnable multiplier applied at end of block
-        self.skip_scale = nn.Parameter(torch.ones(1))
+        self.skip_scale = nn.Parameter(torch.ones(1, **dd))
 
     def forward(
             self,
@@ -265,18 +344,43 @@ class TransformerBlock(nn.Module):
 
         return cache, x
 
+    def _init_weights(self, ctx) -> None:
+        if self.pre_attn_norm.weight is not None:
+            nn.init.ones_(self.pre_attn_norm.weight)
+        if self.post_attn_norm is not None and self.post_attn_norm.weight is not None:
+            nn.init.ones_(self.post_attn_norm.weight)
+        if self.pre_ffw_norm.weight is not None:
+            nn.init.ones_(self.pre_ffw_norm.weight)
+        if self.is_moe:
+            if self.post_ffw1_norm is not None and self.post_ffw1_norm.weight is not None:
+                nn.init.ones_(self.post_ffw1_norm.weight)
+            if self.pre_ffw2_norm.weight is not None:
+                nn.init.ones_(self.pre_ffw2_norm.weight)
+            if self.post_ffw2_norm is not None and self.post_ffw2_norm.weight is not None:
+                nn.init.ones_(self.post_ffw2_norm.weight)
+        if self.post_ffw_norm is not None and self.post_ffw_norm.weight is not None:
+            nn.init.ones_(self.post_ffw_norm.weight)
+        nn.init.ones_(self.skip_scale)
+
 
 # ---------------------------------------------------------------------------
 # TextDecoder
 # ---------------------------------------------------------------------------
 
-class TextDecoder(nn.Module):
+class TextDecoder(InitModule):
     """Full text decoder stack: embedder + N blocks + final norm."""
 
-    def __init__(self, cfg: TextConfig):
+    def __init__(
+            self,
+            cfg: TextConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.cfg = cfg
-        self.embedder = Embedder(cfg)
+        self.embedder = Embedder(cfg, **dd)
 
         # Build attention type sequence
         attn_types = make_attention_pattern(cfg.attention_pattern, cfg.num_layers)
@@ -304,10 +408,15 @@ class TextDecoder(nn.Module):
                 head_dim=layer_head_dim,
                 num_kv_heads=layer_kv_heads,
                 hidden_dim=layer_hidden,
+                **dd,
             ))
         self.blocks = nn.ModuleList(blocks)
 
-        self.final_norm = RMSNorm(cfg.embed_dim, scale_plus_one=False)
+        self.final_norm = RMSNorm(cfg.embed_dim, **dd)
+
+    def _init_weights(self, ctx) -> None:
+        if self.final_norm.weight is not None:
+            nn.init.ones_(self.final_norm.weight)
 
     def forward(
             self,

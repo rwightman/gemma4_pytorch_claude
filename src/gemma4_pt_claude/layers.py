@@ -2,26 +2,21 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .module_utils import InitModule, factory_kwargs
 
 
 # ---------------------------------------------------------------------------
 # RMSNorm
 # ---------------------------------------------------------------------------
 
-class RMSNorm(nn.Module):
-    """RMSNorm with optional learnable scale.
-
-    Args:
-        dim: feature dimension.
-        eps: epsilon for numerical stability.
-        with_scale: if True, learns a per-feature scale parameter.
-        zero_init: if True, initialise scale to zeros (vision encoder uses this).
-        scale_plus_one: if True, effective scale is ``1 + learned_scale``
-            (default for text); otherwise raw ``learned_scale`` (Gemma3n style).
-    """
+class RMSNorm(nn.RMSNorm):
+    """Builtin-backed RMSNorm with optional zero-init weight."""
 
     def __init__(
             self,
@@ -29,37 +24,45 @@ class RMSNorm(nn.Module):
             eps: float = 1e-6,
             with_scale: bool = True,
             zero_init: bool = False,
-            scale_plus_one: bool = True,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
     ):
-        super().__init__()
-        self.eps = eps
-        self.with_scale = with_scale
-        self.scale_plus_one = scale_plus_one
-        if with_scale:
-            if zero_init:
-                init_val = torch.zeros(dim)
-            elif scale_plus_one:
-                # effective scale = 1 + param; init param to 0 → effective 1
-                init_val = torch.zeros(dim)
-            else:
-                # effective scale = param directly; init to 1 → effective 1
-                init_val = torch.ones(dim)
-            self.scale = nn.Parameter(init_val)
-        else:
-            self.register_parameter("scale", None)
+        self.zero_init = zero_init
+        super().__init__(
+            dim,
+            eps=eps,
+            elementwise_affine=with_scale,
+            **factory_kwargs(device, dtype),
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        x = x * rms
-        if self.with_scale:
-            s = self.scale.float()
-            if self.scale_plus_one:
-                x = x * (1.0 + s)
+    def reset_parameters(self) -> None:
+        if self.weight is not None:
+            if self.zero_init:
+                nn.init.zeros_(self.weight)
             else:
-                x = x * s
-        return x.to(dtype)
+                nn.init.ones_(self.weight)
+
+
+class VisionRMSNorm(RMSNorm):
+    """Vision RMSNorm with zero-initialized affine weight."""
+
+    def __init__(
+            self,
+            dim: int,
+            eps: float = 1e-6,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
+        super().__init__(
+            dim,
+            eps=eps,
+            with_scale=True,
+            zero_init=True,
+            device=device,
+            dtype=dtype,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -137,8 +140,17 @@ def apply_multidimensional_rope(
 # ---------------------------------------------------------------------------
 
 
-class TanhGELU(nn.Module):
+class TanhGELU(InitModule):
     """Gemma-style GELU using the tanh approximation."""
+
+    def __init__(
+            self,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        _ = device, dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.gelu(x, approximate="tanh")
@@ -149,41 +161,78 @@ class TanhGELU(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class GatedMLP(nn.Module):
+class GatedMLP(InitModule):
     """Gated feed-forward: ``down(gelu(gate) * up)``.
 
     ``gate_up_proj`` is a single linear producing ``2 * hidden_dim`` outputs
     that are split into gate and up.
     """
 
-    def __init__(self, features: int, hidden_dim: int):
+    def __init__(
+            self,
+            features: int,
+            hidden_dim: int,
+            init_std: float = 1e-2,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.gate_up_proj = nn.Linear(features, 2 * hidden_dim, bias=False)
+        self.init_std = init_std
+        self.residual_init_std = init_std if residual_init_std is None else residual_init_std
+        self.gate_up_proj = nn.Linear(features, 2 * hidden_dim, bias=False, **factory_kwargs(device, dtype))
         self.act = TanhGELU()
-        self.down_proj = nn.Linear(hidden_dim, features, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, features, bias=False, **factory_kwargs(device, dtype))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(self.act(gate) * up)
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.gate_up_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.gate_up_proj.bias is not None:
+            nn.init.zeros_(self.gate_up_proj.bias)
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.down_proj.bias is not None:
+            nn.init.zeros_(self.down_proj.bias)
 
 
 # ---------------------------------------------------------------------------
 # ClippedLinear (audio encoder)
 # ---------------------------------------------------------------------------
 
-class ClippedLinear(nn.Module):
+class ClippedLinear(InitModule):
     """Linear layer with four scalar clip bounds (loaded as buffers, init ±inf)."""
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(
+            self,
+            in_features: int,
+            out_features: int,
+            init_std: float = 1e-2,
+            residual_init_std: float | None = None,
+            bias: bool = False,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.register_buffer("input_min", torch.tensor(float("-inf")))
-        self.register_buffer("input_max", torch.tensor(float("inf")))
-        self.register_buffer("output_min", torch.tensor(float("-inf")))
-        self.register_buffer("output_max", torch.tensor(float("inf")))
+        self.init_std = init_std
+        self.residual_init_std = residual_init_std if residual_init_std is not None else init_std
+        dd = factory_kwargs(device, dtype)
+        self.linear = nn.Linear(in_features, out_features, bias=bias, **dd)
+        self.register_buffer("input_min", torch.tensor(float("-inf"), **dd))
+        self.register_buffer("input_max", torch.tensor(float("inf"), **dd))
+        self.register_buffer("output_min", torch.tensor(float("-inf"), **dd))
+        self.register_buffer("output_max", torch.tensor(float("inf"), **dd))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.clamp(x, self.input_min, self.input_max)
         x = self.linear(x)
         x = torch.clamp(x, self.output_min, self.output_max)
         return x
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.linear.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.linear.bias is not None:
+            nn.init.zeros_(self.linear.bias)

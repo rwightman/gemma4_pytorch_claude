@@ -92,7 +92,12 @@ def _default_audio() -> AudioConfig:
 # Gemma4 E2B (Nano-class, ~2B effective params)
 # ---------------------------------------------------------------------------
 
-def gemma4_e2b(text_only: bool = False) -> Gemma4Model:
+def gemma4_e2b(
+        text_only: bool = False,
+        *,
+        device: str | None = None,
+        dtype=None,
+) -> Gemma4Model:
     """Gemma4 E2B: 35 layers, embed=1536, 8H/1KV, 4:1 pattern, sw=512, pli=256."""
     num_layers = 35
     embed_dim = 1536
@@ -129,14 +134,19 @@ def gemma4_e2b(text_only: bool = False) -> Gemma4Model:
         vision=None if text_only else _e2b_e4b_vision(embed_dim),
         audio=None if text_only else _default_audio(),
     )
-    return Gemma4Model(cfg)
+    return Gemma4Model(cfg, device=device, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
 # Gemma4 E4B (Nano-class, ~4B effective params)
 # ---------------------------------------------------------------------------
 
-def gemma4_e4b(text_only: bool = False) -> Gemma4Model:
+def gemma4_e4b(
+        text_only: bool = False,
+        *,
+        device: str | None = None,
+        dtype=None,
+) -> Gemma4Model:
     """Gemma4 E4B: 42 layers, embed=2560, 8H/2KV, 5:1 pattern, sw=512, pli=256."""
     num_layers = 42
     embed_dim = 2560
@@ -172,14 +182,19 @@ def gemma4_e4b(text_only: bool = False) -> Gemma4Model:
         vision=None if text_only else _e2b_e4b_vision(embed_dim),
         audio=None if text_only else _default_audio(),
     )
-    return Gemma4Model(cfg)
+    return Gemma4Model(cfg, device=device, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
 # Gemma4 31B (Gemma3 27B successor)
 # ---------------------------------------------------------------------------
 
-def gemma4_31b(text_only: bool = False) -> Gemma4Model:
+def gemma4_31b(
+        text_only: bool = False,
+        *,
+        device: str | None = None,
+        dtype=None,
+) -> Gemma4Model:
     """Gemma4 31B: 60 layers, embed=5376, 32H/16KV(4 global KV), 5:1, sw=1024."""
     num_layers = 60
     embed_dim = 5376
@@ -211,14 +226,19 @@ def gemma4_31b(text_only: bool = False) -> Gemma4Model:
         text=text,
         vision=None if text_only else _large_vision(embed_dim),
     )
-    return Gemma4Model(cfg)
+    return Gemma4Model(cfg, device=device, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
 # Gemma4 26B-A4B (MoE variant)
 # ---------------------------------------------------------------------------
 
-def gemma4_26b_a4b(text_only: bool = False) -> Gemma4Model:
+def gemma4_26b_a4b(
+        text_only: bool = False,
+        *,
+        device: str | None = None,
+        dtype=None,
+) -> Gemma4Model:
     """Gemma4 26B-A4B: 30 layers, embed=2816, 16H/8KV(2 global KV), 5:1, MoE."""
     num_layers = 30
     embed_dim = 2816
@@ -256,4 +276,4 @@ def gemma4_26b_a4b(text_only: bool = False) -> Gemma4Model:
         text=text,
         vision=None if text_only else _large_vision(embed_dim),
     )
-    return Gemma4Model(cfg)
+    return Gemma4Model(cfg, device=device, dtype=dtype)

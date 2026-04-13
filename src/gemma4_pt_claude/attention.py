@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from .config import AttentionType
 from .layers import RMSNorm, apply_rope
+from .module_utils import InitModule, factory_kwargs
 
 K_MASK = -2.3819763e38
 
@@ -48,7 +49,7 @@ def create_sliding_mask(
 # Attention
 # ---------------------------------------------------------------------------
 
-class Attention(nn.Module):
+class Attention(InitModule):
     """Multi-head attention (GQA) with QK-norm, V-norm, RoPE, sliding window.
 
     When ``k_eq_v`` is True the key and value projections share weights
@@ -62,6 +63,8 @@ class Attention(nn.Module):
             num_kv_heads: int,
             head_dim: int,
             attn_type: AttentionType,
+            init_std: float,
+            residual_init_std: float | None = None,
             rope_base: int = 10_000,
             rope_scale_factor: float = 1.0,
             rope_proportion: float = 1.0,
@@ -71,11 +74,16 @@ class Attention(nn.Module):
             use_value_norm: bool = False,
             k_eq_v: bool = False,
             attn_impl: str = "sdpa",
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.init_std = init_std
+        self.residual_init_std = init_std if residual_init_std is None else residual_init_std
         self.attn_type = attn_type
         self.rope_base = rope_base
         self.rope_scale_factor = rope_scale_factor
@@ -87,24 +95,46 @@ class Attention(nn.Module):
         self.groups = num_heads // num_kv_heads  # GQA group count
 
         # Projections
-        self.q_proj = nn.Linear(embed_dim, num_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False)
+        dd = factory_kwargs(device, dtype)
+        self.q_proj = nn.Linear(embed_dim, num_heads * head_dim, bias=False, **dd)
+        self.k_proj = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False, **dd)
         if not k_eq_v:
-            self.v_proj = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(num_heads * head_dim, embed_dim, bias=False)
+            self.v_proj = nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False, **dd)
+        self.o_proj = nn.Linear(num_heads * head_dim, embed_dim, bias=False, **dd)
 
         # Norms: QK-norm replaces 1/sqrt(d) scaling, so attn scale = 1.0
         self.query_pre_attn_scalar = 1.0
         if use_qk_norm:
-            self.q_norm = RMSNorm(head_dim, with_scale=True, scale_plus_one=False)
-            self.k_norm = RMSNorm(head_dim, with_scale=True, scale_plus_one=False)
+            self.q_norm = RMSNorm(head_dim, with_scale=True, **dd)
+            self.k_norm = RMSNorm(head_dim, with_scale=True, **dd)
         else:
             self.q_norm = self.k_norm = None
 
         if use_value_norm:
-            self.v_norm = RMSNorm(head_dim, with_scale=False)
+            self.v_norm = RMSNorm(head_dim, with_scale=False, **dd)
         else:
             self.v_norm = None
+
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        if hasattr(self, "v_proj"):
+            nn.init.normal_(self.v_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.v_proj.bias is not None:
+                nn.init.zeros_(self.v_proj.bias)
+        nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+        if self.o_proj.bias is not None:
+            nn.init.zeros_(self.o_proj.bias)
+        if self.q_norm is not None and self.q_norm.weight is not None:
+            nn.init.ones_(self.q_norm.weight)
+        if self.k_norm is not None and self.k_norm.weight is not None:
+            nn.init.ones_(self.k_norm.weight)
+        if self.v_norm is not None and self.v_norm.weight is not None:
+            nn.init.ones_(self.v_norm.weight)
 
     # ---- cache helpers ---------------------------------------------------
 

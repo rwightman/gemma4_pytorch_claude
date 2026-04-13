@@ -54,13 +54,13 @@ def _hf_key_to_ours(
 
     # --- Final norm ---
     if k == "norm.weight":
-        return "text_decoder.final_norm.scale"
+        return "text_decoder.final_norm.weight"
 
     # --- Global PLI (embedder-level) ---
     _global_pli_map = {
         "embed_tokens_per_layer.weight": "text_decoder.embedder.pli_embedding.weight",
         "per_layer_model_projection.weight": "text_decoder.embedder.pli_proj.weight",
-        "per_layer_projection_norm.weight": "text_decoder.embedder.pli_proj_norm.scale",
+        "per_layer_projection_norm.weight": "text_decoder.embedder.pli_proj_norm.weight",
     }
     if k in _global_pli_map:
         return _global_pli_map[k]
@@ -91,8 +91,8 @@ def _hf_key_to_ours(
             "self_attn.k_proj.weight": "attn.k_proj.weight",
             "self_attn.v_proj.weight": "attn.v_proj.weight",
             "self_attn.o_proj.weight": "attn.o_proj.weight",
-            "self_attn.q_norm.weight": "attn.q_norm.scale",
-            "self_attn.k_norm.weight": "attn.k_norm.scale",
+            "self_attn.q_norm.weight": "attn.q_norm.weight",
+            "self_attn.k_norm.weight": "attn.k_norm.weight",
         }
         if rest in _attn_map:
             return f"{prefix}.{_attn_map[rest]}"
@@ -111,10 +111,10 @@ def _hf_key_to_ours(
 
         # Norms
         _norm_map = {
-            "input_layernorm.weight": "pre_attn_norm.scale",
-            "post_attention_layernorm.weight": "post_attn_norm.scale",
-            "pre_feedforward_layernorm.weight": "pre_ffw_norm.scale",
-            "post_feedforward_layernorm.weight": "post_ffw_norm.scale",
+            "input_layernorm.weight": "pre_attn_norm.weight",
+            "post_attention_layernorm.weight": "post_attn_norm.weight",
+            "pre_feedforward_layernorm.weight": "pre_ffw_norm.weight",
+            "post_feedforward_layernorm.weight": "post_ffw_norm.weight",
         }
         if rest in _norm_map:
             return f"{prefix}.{_norm_map[rest]}"
@@ -127,7 +127,7 @@ def _hf_key_to_ours(
         _pli_map = {
             "per_layer_input_gate.weight": "pli_mapping.gate.weight",
             "per_layer_projection.weight": "pli_mapping.proj.weight",
-            "post_per_layer_input_norm.weight": "pli_mapping.norm.scale",
+            "post_per_layer_input_norm.weight": "pli_mapping.norm.weight",
         }
         if rest in _pli_map:
             return f"{prefix}.{_pli_map[rest]}"
@@ -208,18 +208,18 @@ def _hf_audio_key_to_ours(k: str) -> str | None:
 
         # Exact-match keys (norms, per_dim_scale, pos_proj, dwconv)
         _conformer_exact = {
-            "ffw_start.pre_norm.scale": f"{prefix}.ffw_start.pre_norm.scale",
-            "ffw_start.post_norm.scale": f"{prefix}.ffw_start.post_norm.scale",
-            "attn.pre_norm.scale": f"{prefix}.attn.pre_norm.scale",
+            "ffw_start.pre_norm.scale": f"{prefix}.ffw_start.pre_norm.weight",
+            "ffw_start.post_norm.scale": f"{prefix}.ffw_start.post_norm.weight",
+            "attn.pre_norm.scale": f"{prefix}.attn.pre_norm.weight",
             "attn.attn.per_dim_scale": f"{prefix}.attn.attn.per_dim_scale",
             "attn.attn.rel_pos_emb.pos_proj.weight": f"{prefix}.attn.attn.rel_pos_emb.pos_proj.weight",
-            "attn.post_norm.scale": f"{prefix}.attn.post_norm.scale",
-            "lconv.pre_norm.scale": f"{prefix}.lconv.pre_norm.scale",
+            "attn.post_norm.scale": f"{prefix}.attn.post_norm.weight",
+            "lconv.pre_norm.scale": f"{prefix}.lconv.pre_norm.weight",
             "lconv.dwconv.weight": f"{prefix}.lconv.dwconv.weight",
-            "lconv.conv_norm.scale": f"{prefix}.lconv.conv_norm.scale",
-            "ffw_end.pre_norm.scale": f"{prefix}.ffw_end.pre_norm.scale",
-            "ffw_end.post_norm.scale": f"{prefix}.ffw_end.post_norm.scale",
-            "norm.scale": f"{prefix}.norm.scale",
+            "lconv.conv_norm.scale": f"{prefix}.lconv.conv_norm.weight",
+            "ffw_end.pre_norm.scale": f"{prefix}.ffw_end.pre_norm.weight",
+            "ffw_end.post_norm.scale": f"{prefix}.ffw_end.post_norm.weight",
+            "norm.scale": f"{prefix}.norm.weight",
         }
         if layer_rest in _conformer_exact:
             return _conformer_exact[layer_rest]
@@ -266,18 +266,18 @@ def _hf_audio_key_to_ours(k: str) -> str | None:
 
         # Exact-match keys (norms, per_dim_scale, pos_proj, dwconv)
         conformer_exact = {
-            "feed_forward1.pre_layer_norm.weight": f"{prefix}.ffw_start.pre_norm.scale",
-            "feed_forward1.post_layer_norm.weight": f"{prefix}.ffw_start.post_norm.scale",
-            "norm_pre_attn.weight": f"{prefix}.attn.pre_norm.scale",
+            "feed_forward1.pre_layer_norm.weight": f"{prefix}.ffw_start.pre_norm.weight",
+            "feed_forward1.post_layer_norm.weight": f"{prefix}.ffw_start.post_norm.weight",
+            "norm_pre_attn.weight": f"{prefix}.attn.pre_norm.weight",
             "self_attn.per_dim_scale": f"{prefix}.attn.attn.per_dim_scale",
             "self_attn.relative_k_proj.weight": f"{prefix}.attn.attn.rel_pos_emb.pos_proj.weight",
-            "norm_post_attn.weight": f"{prefix}.attn.post_norm.scale",
-            "lconv1d.pre_layer_norm.weight": f"{prefix}.lconv.pre_norm.scale",
+            "norm_post_attn.weight": f"{prefix}.attn.post_norm.weight",
+            "lconv1d.pre_layer_norm.weight": f"{prefix}.lconv.pre_norm.weight",
             "lconv1d.depthwise_conv1d.weight": f"{prefix}.lconv.dwconv.weight",
-            "lconv1d.conv_norm.weight": f"{prefix}.lconv.conv_norm.scale",
-            "feed_forward2.pre_layer_norm.weight": f"{prefix}.ffw_end.pre_norm.scale",
-            "feed_forward2.post_layer_norm.weight": f"{prefix}.ffw_end.post_norm.scale",
-            "norm_out.weight": f"{prefix}.norm.scale",
+            "lconv1d.conv_norm.weight": f"{prefix}.lconv.conv_norm.weight",
+            "feed_forward2.pre_layer_norm.weight": f"{prefix}.ffw_end.pre_norm.weight",
+            "feed_forward2.post_layer_norm.weight": f"{prefix}.ffw_end.post_norm.weight",
+            "norm_out.weight": f"{prefix}.norm.weight",
         }
         if layer_rest in conformer_exact:
             return conformer_exact[layer_rest]
@@ -335,8 +335,8 @@ def _hf_vision_key_to_ours(
 
         # QK/V norms
         _norm_attn_map = {
-            "self_attn.q_norm.weight": f"{prefix}.attn.q_norm.scale",
-            "self_attn.k_norm.weight": f"{prefix}.attn.k_norm.scale",
+            "self_attn.q_norm.weight": f"{prefix}.attn.q_norm.weight",
+            "self_attn.k_norm.weight": f"{prefix}.attn.k_norm.weight",
         }
         if rest in _norm_attn_map:
             return _norm_attn_map[rest]
@@ -352,10 +352,10 @@ def _hf_vision_key_to_ours(
 
         # Layer norms
         _norm_map = {
-            "input_layernorm.weight": f"{prefix}.pre_attn_norm.scale",
-            "post_attention_layernorm.weight": f"{prefix}.post_attn_norm.scale",
-            "pre_feedforward_layernorm.weight": f"{prefix}.pre_ffw_norm.scale",
-            "post_feedforward_layernorm.weight": f"{prefix}.post_ffw_norm.scale",
+            "input_layernorm.weight": f"{prefix}.pre_attn_norm.weight",
+            "post_attention_layernorm.weight": f"{prefix}.post_attn_norm.weight",
+            "pre_feedforward_layernorm.weight": f"{prefix}.pre_ffw_norm.weight",
+            "post_feedforward_layernorm.weight": f"{prefix}.post_ffw_norm.weight",
         }
         if rest in _norm_map:
             return _norm_map[rest]
@@ -445,6 +445,21 @@ def _load_safetensors_files(path: str | Path) -> dict[str, torch.Tensor]:
     return tensors
 
 
+def _remap_legacy_scale_keys(
+        tensors: dict[str, torch.Tensor],
+        expected_keys: set[str],
+) -> dict[str, torch.Tensor]:
+    remapped: dict[str, torch.Tensor] = {}
+    for key, value in tensors.items():
+        if key.endswith(".scale"):
+            new_key = f"{key[:-len('.scale')]}.weight"
+            if new_key in expected_keys and key not in expected_keys:
+                remapped[new_key] = value
+                continue
+        remapped[key] = value
+    return remapped
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -497,6 +512,8 @@ def load_weights(
                 else None
             ),
         )
+
+    raw = _remap_legacy_scale_keys(raw, set(model.state_dict().keys()))
 
     is_meta_model = any(param.is_meta for param in model.parameters()) or any(
         buffer.is_meta for buffer in model.buffers()

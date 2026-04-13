@@ -157,27 +157,27 @@ def _map_text_layer(
     for jax_name, pt_name in [("query_norm", "q_norm"), ("key_norm", "k_norm")]:
         jax_norm = f"{jax_prefix}/attn/{jax_name}/scale"
         if jax_norm in jax_params:
-            out[f"{pt_prefix}.attn.{pt_name}.scale"] = _convert_scale(jax_params[jax_norm])
+            out[f"{pt_prefix}.attn.{pt_name}.weight"] = _convert_scale(jax_params[jax_norm])
 
     # --- Pre/post attention norms ---
     pre_attn = f"{jax_prefix}/pre_attention_norm/scale"
     if pre_attn in jax_params:
-        out[f"{pt_prefix}.pre_attn_norm.scale"] = _convert_scale(jax_params[pre_attn])
+        out[f"{pt_prefix}.pre_attn_norm.weight"] = _convert_scale(jax_params[pre_attn])
 
     post_attn = f"{jax_prefix}/post_attention_norm/scale"
     if post_attn in jax_params:
-        out[f"{pt_prefix}.post_attn_norm.scale"] = _convert_scale(jax_params[post_attn])
+        out[f"{pt_prefix}.post_attn_norm.weight"] = _convert_scale(jax_params[post_attn])
 
     # --- Feed-forward ---
     if has_moe:
         # MoE layers have separate handling
         # Pre/post FFW norms for MoE branch
         for jax_name, pt_name in [
-            (f"{jax_prefix}/pre_ffw_norm/scale", f"{pt_prefix}.pre_ffw_norm.scale"),
-            (f"{jax_prefix}/post_ffw1_norm/scale", f"{pt_prefix}.post_ffw1_norm.scale"),
-            (f"{jax_prefix}/pre_ffw2_norm/scale", f"{pt_prefix}.pre_ffw2_norm.scale"),
-            (f"{jax_prefix}/post_ffw2_norm/scale", f"{pt_prefix}.post_ffw2_norm.scale"),
-            (f"{jax_prefix}/post_ffw_norm/scale", f"{pt_prefix}.post_ffw_norm.scale"),
+            (f"{jax_prefix}/pre_ffw_norm/scale", f"{pt_prefix}.pre_ffw_norm.weight"),
+            (f"{jax_prefix}/post_ffw1_norm/scale", f"{pt_prefix}.post_ffw1_norm.weight"),
+            (f"{jax_prefix}/pre_ffw2_norm/scale", f"{pt_prefix}.pre_ffw2_norm.weight"),
+            (f"{jax_prefix}/post_ffw2_norm/scale", f"{pt_prefix}.post_ffw2_norm.weight"),
+            (f"{jax_prefix}/post_ffw_norm/scale", f"{pt_prefix}.post_ffw_norm.weight"),
         ]:
             if jax_name in jax_params:
                 out[pt_name] = _convert_scale(jax_params[jax_name])
@@ -194,10 +194,10 @@ def _map_text_layer(
         # Pre/post FFW norms
         pre_ffw = f"{jax_prefix}/pre_ffw_norm/scale"
         if pre_ffw in jax_params:
-            out[f"{pt_prefix}.pre_ffw_norm.scale"] = _convert_scale(jax_params[pre_ffw])
+            out[f"{pt_prefix}.pre_ffw_norm.weight"] = _convert_scale(jax_params[pre_ffw])
         post_ffw = f"{jax_prefix}/post_ffw_norm/scale"
         if post_ffw in jax_params:
-            out[f"{pt_prefix}.post_ffw_norm.scale"] = _convert_scale(jax_params[post_ffw])
+            out[f"{pt_prefix}.post_ffw_norm.weight"] = _convert_scale(jax_params[post_ffw])
 
     # --- Skip scale ---
     skip_key = f"{jax_prefix}/skip_scale"
@@ -213,7 +213,7 @@ def _map_text_layer(
         out[f"{pt_prefix}.pli_mapping.proj.weight"] = _convert_linear(jax_params[pli_proj_key])
     pli_norm_key = f"{jax_prefix}/post_per_layer_input_norm/scale"
     if pli_norm_key in jax_params:
-        out[f"{pt_prefix}.pli_mapping.norm.scale"] = _convert_scale(jax_params[pli_norm_key])
+        out[f"{pt_prefix}.pli_mapping.norm.weight"] = _convert_scale(jax_params[pli_norm_key])
 
     return out
 
@@ -288,7 +288,7 @@ def _convert_vision_orbax(
         if s_key in jax_params:
             stacked = jax_params[s_key]
             for i in range(nl):
-                state_dict[f"{prefix}.layers.{i}.attn.{pt_name}.scale"] = (
+                state_dict[f"{prefix}.layers.{i}.attn.{pt_name}.weight"] = (
                     _convert_scale(stacked[i])
                 )
 
@@ -319,10 +319,10 @@ def _convert_vision_orbax(
 
     # Layer norms — stacked (nl, d_model)
     for jax_name, pt_name in [
-        ("pre_attention_norm/scale", "pre_attn_norm.scale"),
-        ("post_attention_norm/scale", "post_attn_norm.scale"),
-        ("pre_ffw_norm/scale", "pre_ffw_norm.scale"),
-        ("post_ffw_norm/scale", "post_ffw_norm.scale"),
+        ("pre_attention_norm/scale", "pre_attn_norm.weight"),
+        ("post_attention_norm/scale", "post_attn_norm.weight"),
+        ("pre_ffw_norm/scale", "pre_ffw_norm.weight"),
+        ("post_ffw_norm/scale", "post_ffw_norm.weight"),
     ]:
         s_key = f"{jax_block}/{jax_name}"
         if s_key in jax_params:
@@ -430,7 +430,7 @@ def _convert_audio_orbax(
                 if k in jax_params:
                     state_dict[f"{pt_pfx}.{pt_ffw}.{pt_proj}"] = _convert_linear(jax_params[k])
             # Norms
-            for jax_n, pt_n in [("pre_layer_norm/scale", "pre_norm.scale"), ("post_layer_norm/scale", "post_norm.scale")]:
+            for jax_n, pt_n in [("pre_layer_norm/scale", "pre_norm.weight"), ("post_layer_norm/scale", "post_norm.weight")]:
                 k = f"{jax_pfx}/{jax_ffw}/{jax_n}"
                 if k in jax_params:
                     state_dict[f"{pt_pfx}.{pt_ffw}.{pt_n}"] = _convert_scale(jax_params[k])
@@ -463,7 +463,7 @@ def _convert_audio_orbax(
             else:
                 state_dict[f"{pt_pfx}.attn.o_proj.linear.weight"] = _convert_linear(w)
         # Pre/post norms
-        for jax_n, pt_n in [("pre_norm/scale", "attn.pre_norm.scale"), ("post_norm/scale", "attn.post_norm.scale")]:
+        for jax_n, pt_n in [("pre_norm/scale", "attn.pre_norm.weight"), ("post_norm/scale", "attn.post_norm.weight")]:
             k = f"{attn_pfx}/{jax_n}"
             if k in jax_params:
                 state_dict[f"{pt_pfx}.{pt_n}"] = _convert_scale(jax_params[k])
@@ -471,9 +471,9 @@ def _convert_audio_orbax(
         # Lightweight conv (lconv)
         lconv_pfx = f"{jax_pfx}/lconv"
         for jax_k, pt_k in [
-            ("ln/scale", "lconv.pre_norm.scale"),
+            ("ln/scale", "lconv.pre_norm.weight"),
             ("linear_start/kernel", "lconv.linear_start.linear.weight"),
-            ("conv_norm/scale", "lconv.conv_norm.scale"),
+            ("conv_norm/scale", "lconv.conv_norm.weight"),
             ("linear_end/kernel", "lconv.linear_end.linear.weight"),
         ]:
             k = f"{lconv_pfx}/{jax_k}"
@@ -495,7 +495,7 @@ def _convert_audio_orbax(
         # Final layer norm
         k = f"{jax_pfx}/final_ln/scale"
         if k in jax_params:
-            state_dict[f"{pt_pfx}.norm.scale"] = _convert_scale(jax_params[k])
+            state_dict[f"{pt_pfx}.norm.weight"] = _convert_scale(jax_params[k])
 
         # ClippedLinear bounds for all clipped projections
         _audio_clip_map = [
@@ -596,7 +596,7 @@ def convert_orbax(
         state_dict["text_decoder.embedder.pli_proj.weight"] = _convert_linear(w_flat)
     pli_proj_norm_key = "embedder/per_layer_projection_norm/scale"
     if pli_proj_norm_key in jax_params:
-        state_dict["text_decoder.embedder.pli_proj_norm.scale"] = (
+        state_dict["text_decoder.embedder.pli_proj_norm.weight"] = (
             _convert_scale(jax_params[pli_proj_norm_key])
         )
 
@@ -612,7 +612,7 @@ def convert_orbax(
     # Final norm
     final_norm_key = "final_norm/scale"
     if final_norm_key in jax_params:
-        state_dict["text_decoder.final_norm.scale"] = _convert_scale(jax_params[final_norm_key])
+        state_dict["text_decoder.final_norm.weight"] = _convert_scale(jax_params[final_norm_key])
 
     # --- Vision encoder ---
     vision_cfg = model.cfg.vision

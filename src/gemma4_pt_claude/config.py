@@ -103,6 +103,10 @@ class VisionConfig:
     use_clipped_linear: bool = False
     standardize: bool = False
     rms_norm_eps: float = 1e-6
+    init_std: float = 1e-2
+    position_init_std: float = 2e-2
+    residual_init_std: float | None = None
+    use_depth_scaled_residual_init: bool = False
     rope_base_frequency: float = 100.0
     text_embed_dim: int = 1536        # projection target (set per variant)
 
@@ -122,6 +126,9 @@ class AudioConfig:
     attn_logit_cap: float = 50.0
     conv_kernel_size: int = 5
     residual_weight: float = 0.5
+    init_std: float = 1e-2
+    residual_init_std: float | None = None
+    use_depth_scaled_residual_init: bool = False
     input_feat_size: int = 128
     gradient_clipping: float = 1e10
     sscp_channels: tuple[int, int] = (128, 32)
@@ -190,6 +197,9 @@ class TextConfig:
 
     # Attention implementation: "sdpa" (F.scaled_dot_product_attention) or "eager" (manual einsum)
     attn_impl: str = "sdpa"
+    init_std: float = 1e-2
+    residual_init_std: float | None = None
+    use_depth_scaled_residual_init: bool = False
 
 
 # ---------------------------------------------------------------------------

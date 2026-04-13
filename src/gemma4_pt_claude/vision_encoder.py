@@ -12,7 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import VisionConfig
-from .layers import ClippedLinear, RMSNorm, TanhGELU, apply_multidimensional_rope
+from .layers import ClippedLinear, RMSNorm, TanhGELU, VisionRMSNorm, apply_multidimensional_rope
+from .module_utils import InitModule, factory_kwargs, resolve_residual_init_std
 
 
 # ---------------------------------------------------------------------------
@@ -23,27 +24,48 @@ def _make_vision_proj(
         cfg: VisionConfig,
         in_features: int,
         out_features: int,
+        *,
+        residual_init_std: float | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
 ) -> ClippedLinear | nn.Linear:
     """Build a projection layer — ClippedLinear when the config asks for it."""
     if cfg.use_clipped_linear:
-        return ClippedLinear(in_features, out_features, bias=False)
-    return nn.Linear(in_features, out_features, bias=False)
+        return ClippedLinear(
+            in_features,
+            out_features,
+            bias=False,
+            init_std=cfg.init_std,
+            residual_init_std=residual_init_std,
+            device=device,
+            dtype=dtype,
+        )
+    return nn.Linear(in_features, out_features, bias=False, **factory_kwargs(device, dtype))
 
 
 # ---------------------------------------------------------------------------
 # Patch embedder with factorised 2-D positional embedding
 # ---------------------------------------------------------------------------
 
-class VisionPatchEmbedder(nn.Module):
-    def __init__(self, cfg: VisionConfig):
+class VisionPatchEmbedder(InitModule):
+    def __init__(
+            self,
+            cfg: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.cfg = cfg
+        self.init_std = cfg.init_std
+        self.position_init_std = cfg.position_init_std
         patch_dim = 3 * cfg.patch_size ** 2
         # JAX uses plain Einsum (not ClippedEinsum) for input_projection
         # across all model sizes, so always use nn.Linear here.
-        self.input_proj = nn.Linear(patch_dim, cfg.d_model, bias=False)
+        self.input_proj = nn.Linear(patch_dim, cfg.d_model, bias=False, **dd)
         self.position_embedding_table = nn.Parameter(
-            torch.zeros(2, cfg.position_embedding_size, cfg.d_model),
+            torch.zeros(2, cfg.position_embedding_size, cfg.d_model, **dd),
         )
 
     def _position_embeddings(
@@ -85,43 +107,112 @@ class VisionPatchEmbedder(nn.Module):
         pos_emb = self._position_embeddings(position_ids, padding_mask)
         return hidden + pos_emb
 
+    def _init_weights(self, ctx) -> None:
+        nn.init.normal_(self.input_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)
+        nn.init.normal_(
+            self.position_embedding_table,
+            mean=0.0,
+            std=self.position_init_std,
+            generator=ctx.generator,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Vision MLP (gated, separate gate/up/down)
 # ---------------------------------------------------------------------------
 
-class VisionMLP(nn.Module):
-    def __init__(self, cfg: VisionConfig):
+class VisionMLP(InitModule):
+    def __init__(
+            self,
+            cfg: VisionConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.gate_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden)
-        self.up_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden)
-        self.act = TanhGELU()
-        self.down_proj = _make_vision_proj(cfg, cfg.ffw_hidden, cfg.d_model)
+        self.init_std = cfg.init_std
+        self.residual_init_std = cfg.init_std if residual_init_std is None else residual_init_std
+        dd = factory_kwargs(device, dtype)
+        self.gate_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden, residual_init_std=cfg.init_std, **dd)
+        self.up_proj = _make_vision_proj(cfg, cfg.d_model, cfg.ffw_hidden, residual_init_std=cfg.init_std, **dd)
+        self.act = TanhGELU(**dd)
+        self.down_proj = _make_vision_proj(cfg, cfg.ffw_hidden, cfg.d_model, residual_init_std=residual_init_std, **dd)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+
+    def _init_weights(self, ctx) -> None:
+        if isinstance(self.gate_proj, nn.Linear):
+            nn.init.normal_(self.gate_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.gate_proj.bias is not None:
+                nn.init.zeros_(self.gate_proj.bias)
+        if isinstance(self.up_proj, nn.Linear):
+            nn.init.normal_(self.up_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.up_proj.bias is not None:
+                nn.init.zeros_(self.up_proj.bias)
+        if isinstance(self.down_proj, nn.Linear):
+            nn.init.normal_(self.down_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+            if self.down_proj.bias is not None:
+                nn.init.zeros_(self.down_proj.bias)
 
 
 # ---------------------------------------------------------------------------
 # Vision attention (full MHA with 2-D RoPE + QK/V-norm)
 # ---------------------------------------------------------------------------
 
-class VisionAttention(nn.Module):
-    def __init__(self, cfg: VisionConfig):
+class VisionAttention(InitModule):
+    def __init__(
+            self,
+            cfg: VisionConfig,
+            residual_init_std: float | None = None,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        self.init_std = cfg.init_std
+        self.residual_init_std = cfg.init_std if residual_init_std is None else residual_init_std
+        self.rope_base_frequency = cfg.rope_base_frequency
         self.num_heads = cfg.num_heads
         self.head_dim = cfg.head_dim
         self.d_model = cfg.d_model
-        self.rope_base_frequency = cfg.rope_base_frequency
+        dd = factory_kwargs(device, dtype)
 
-        self.q_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim)
-        self.k_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim)
-        self.v_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim)
-        self.o_proj = _make_vision_proj(cfg, cfg.num_heads * cfg.head_dim, cfg.d_model)
+        self.q_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim, residual_init_std=self.init_std, **dd)
+        self.k_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim, residual_init_std=self.init_std, **dd)
+        self.v_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim, residual_init_std=self.init_std, **dd)
+        self.o_proj = _make_vision_proj(cfg, cfg.num_heads * cfg.head_dim, cfg.d_model, residual_init_std=self.residual_init_std, **dd)
 
-        self.q_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, scale_plus_one=False)
-        self.k_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, scale_plus_one=False)
-        self.v_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, with_scale=False)
+        self.q_norm = VisionRMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, **dd)
+        self.k_norm = VisionRMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, **dd)
+        self.v_norm = RMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, with_scale=False, **dd)
+
+    def _init_weights(self, ctx) -> None:
+        if isinstance(self.q_proj, nn.Linear):
+            nn.init.normal_(self.q_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.q_proj.bias is not None:
+                nn.init.zeros_(self.q_proj.bias)
+        if isinstance(self.k_proj, nn.Linear):
+            nn.init.normal_(self.k_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.k_proj.bias is not None:
+                nn.init.zeros_(self.k_proj.bias)
+        if isinstance(self.v_proj, nn.Linear):
+            nn.init.normal_(self.v_proj.weight, mean=0.0, std=self.init_std, generator=ctx.generator)
+            if self.v_proj.bias is not None:
+                nn.init.zeros_(self.v_proj.bias)
+        if isinstance(self.o_proj, nn.Linear):
+            nn.init.normal_(self.o_proj.weight, mean=0.0, std=self.residual_init_std, generator=ctx.generator)
+            if self.o_proj.bias is not None:
+                nn.init.zeros_(self.o_proj.bias)
+        if self.q_norm.weight is not None:
+            nn.init.zeros_(self.q_norm.weight)
+        if self.k_norm.weight is not None:
+            nn.init.zeros_(self.k_norm.weight)
+        if self.v_norm.weight is not None:
+            nn.init.ones_(self.v_norm.weight)
 
     def forward(
             self,
@@ -177,15 +268,29 @@ class VisionAttention(nn.Module):
 # Vision transformer block
 # ---------------------------------------------------------------------------
 
-class VisionBlock(nn.Module):
-    def __init__(self, cfg: VisionConfig, layer_idx: int):
+class VisionBlock(InitModule):
+    def __init__(
+            self,
+            cfg: VisionConfig,
+            layer_idx: int,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
-        self.pre_attn_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
-        self.post_attn_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
-        self.pre_ffw_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
-        self.post_ffw_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, scale_plus_one=False)
-        self.attn = VisionAttention(cfg)
-        self.mlp = VisionMLP(cfg)
+        residual_init_std = resolve_residual_init_std(
+            cfg.init_std,
+            cfg.residual_init_std,
+            cfg.use_depth_scaled_residual_init,
+            cfg.num_layers,
+        )
+        dd = factory_kwargs(device, dtype)
+        self.pre_attn_norm = VisionRMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, **dd)
+        self.post_attn_norm = VisionRMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, **dd)
+        self.pre_ffw_norm = VisionRMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, **dd)
+        self.post_ffw_norm = VisionRMSNorm(cfg.d_model, eps=cfg.rms_norm_eps, **dd)
+        self.attn = VisionAttention(cfg, residual_init_std=residual_init_std, **dd)
+        self.mlp = VisionMLP(cfg, residual_init_std=residual_init_std, **dd)
 
     def forward(
             self,
@@ -206,14 +311,31 @@ class VisionBlock(nn.Module):
         x = residual + x
         return x
 
+    def _init_weights(self, ctx) -> None:
+        if self.pre_attn_norm.weight is not None:
+            nn.init.zeros_(self.pre_attn_norm.weight)
+        if self.post_attn_norm.weight is not None:
+            nn.init.zeros_(self.post_attn_norm.weight)
+        if self.pre_ffw_norm.weight is not None:
+            nn.init.zeros_(self.pre_ffw_norm.weight)
+        if self.post_ffw_norm.weight is not None:
+            nn.init.zeros_(self.post_ffw_norm.weight)
+
 
 # ---------------------------------------------------------------------------
 # Spatial pooler (position-aware average pooling)
 # ---------------------------------------------------------------------------
 
-class VisionPooler(nn.Module):
-    def __init__(self, cfg: VisionConfig):
+class VisionPooler(InitModule):
+    def __init__(
+            self,
+            cfg: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        _ = device, dtype
         self.root_hidden_size = cfg.d_model ** 0.5
 
     def _avg_pool_by_positions(
@@ -279,25 +401,32 @@ class VisionPooler(nn.Module):
 # VisionEncoder (top-level)
 # ---------------------------------------------------------------------------
 
-class VisionEncoder(nn.Module):
+class VisionEncoder(InitModule):
     """Full vision encoder: patches → blocks → pool.
 
     Does NOT include projection to text space — that is handled by
     MultimodalEmbedder in model.py.
     """
 
-    def __init__(self, cfg: VisionConfig):
+    def __init__(
+            self,
+            cfg: VisionConfig,
+            *,
+            device: torch.device | str | None = None,
+            dtype: torch.dtype | None = None,
+    ):
         super().__init__()
+        dd = factory_kwargs(device, dtype)
         self.cfg = cfg
-        self.patch_embedder = VisionPatchEmbedder(cfg)
+        self.patch_embedder = VisionPatchEmbedder(cfg, **dd)
         self.layers = nn.ModuleList([
-            VisionBlock(cfg, layer_idx=i) for i in range(cfg.num_layers)
+            VisionBlock(cfg, layer_idx=i, **dd) for i in range(cfg.num_layers)
         ])
-        self.pooler = VisionPooler(cfg)
+        self.pooler = VisionPooler(cfg, **dd)
 
         if cfg.standardize:
-            self.register_buffer("std_bias", torch.zeros(cfg.d_model))
-            self.register_buffer("std_scale", torch.ones(cfg.d_model))
+            self.register_buffer("std_bias", torch.zeros(cfg.d_model, **dd))
+            self.register_buffer("std_scale", torch.ones(cfg.d_model, **dd))
 
     def forward(
             self,
@@ -343,3 +472,8 @@ class VisionEncoder(nn.Module):
             hidden_states = (hidden_states - self.std_bias) * self.std_scale
 
         return hidden_states, pooler_mask
+
+    def _init_weights(self, ctx) -> None:
+        if self.cfg.standardize:
+            self.std_bias.zero_()
+            self.std_scale.fill_(1.0)

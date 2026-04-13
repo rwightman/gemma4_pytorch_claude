@@ -26,7 +26,7 @@ class TestHFKeyMapping:
 
     def test_final_norm(self):
         assert _hf_key_to_ours("model.language_model.norm.weight", 4) == (
-            "text_decoder.final_norm.scale"
+            "text_decoder.final_norm.weight"
         )
 
     def test_attn_proj(self):
@@ -55,13 +55,13 @@ class TestHFKeyMapping:
         result = _hf_key_to_ours(
             "model.language_model.layers.1.input_layernorm.weight", 4
         )
-        assert result == "text_decoder.blocks.1.pre_attn_norm.scale"
+        assert result == "text_decoder.blocks.1.pre_attn_norm.weight"
 
     def test_qk_norm(self):
         result = _hf_key_to_ours(
             "model.language_model.layers.0.self_attn.q_norm.weight", 4
         )
-        assert result == "text_decoder.blocks.0.attn.q_norm.scale"
+        assert result == "text_decoder.blocks.0.attn.q_norm.weight"
 
     def test_skip_scale(self):
         result = _hf_key_to_ours(
@@ -86,7 +86,7 @@ class TestHFKeyMapping:
         ) == "text_decoder.embedder.pli_proj.weight"
         assert _hf_key_to_ours(
             "model.language_model.per_layer_projection_norm.weight", 4
-        ) == "text_decoder.embedder.pli_proj_norm.scale"
+        ) == "text_decoder.embedder.pli_proj_norm.weight"
 
     def test_pli_layer_keys(self):
         assert _hf_key_to_ours(
@@ -97,7 +97,7 @@ class TestHFKeyMapping:
         ) == "text_decoder.blocks.0.pli_mapping.proj.weight"
         assert _hf_key_to_ours(
             "model.language_model.layers.0.post_per_layer_input_norm.weight", 4
-        ) == "text_decoder.blocks.0.pli_mapping.norm.scale"
+        ) == "text_decoder.blocks.0.pli_mapping.norm.weight"
 
 
 class TestHFConvertWeights:
@@ -219,6 +219,17 @@ class TestLoadWeights:
         assert meta_model.text_decoder.embedder.pli_proj_scale > 0.0
         assert not meta_model.audio_encoder.conformer[0].attn.attn.local_causal_mask.is_meta
 
+    def test_materialize_initializes_meta_model_and_runtime_buffers(self):
+        cfg = self._runtime_buffer_config(with_audio=True)
+        with torch.device("meta"):
+            model = Gemma4Model(cfg)
+
+        model.materialize(device="cpu", dtype=torch.float32, init_weights=True)
+
+        assert not model.text_decoder.embedder.token_embedding.weight.is_meta
+        assert model.text_decoder.embedder.token_embedding.weight.dtype == torch.float32
+        assert not model.audio_encoder.conformer[0].attn.attn.local_causal_mask.is_meta
+
 
 class TestVisionKeyMapping:
     def test_patch_embedder(self):
@@ -245,7 +256,7 @@ class TestVisionKeyMapping:
     def test_encoder_layer_norm(self):
         assert _hf_vision_key_to_ours(
             "vision_tower.encoder.layers.5.input_layernorm.weight"
-        ) == "vision_encoder.layers.5.pre_attn_norm.scale"
+        ) == "vision_encoder.layers.5.pre_attn_norm.weight"
 
     def test_encoder_layer_mlp(self):
         assert _hf_vision_key_to_ours(
@@ -266,7 +277,7 @@ class TestVisionKeyMapping:
     def test_qk_norm(self):
         assert _hf_vision_key_to_ours(
             "vision_tower.encoder.layers.0.self_attn.q_norm.weight"
-        ) == "vision_encoder.layers.0.attn.q_norm.scale"
+        ) == "vision_encoder.layers.0.attn.q_norm.weight"
 
     def test_standardize_buffers(self):
         assert _hf_vision_key_to_ours("vision_tower.std_bias") == "vision_encoder.std_bias"

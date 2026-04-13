@@ -7,6 +7,7 @@ from gemma4_pt_claude.layers import (
     GatedMLP,
     RMSNorm,
     TanhGELU,
+    VisionRMSNorm,
     apply_multidimensional_rope,
     apply_rope,
 )
@@ -19,19 +20,8 @@ class TestRMSNorm:
         out = norm(x)
         assert out.shape == x.shape
 
-    def test_scale_plus_one_default(self):
-        """scale_plus_one=True: param init 0 → effective scale 1 → output ≈ normed input."""
-        norm = RMSNorm(32, scale_plus_one=True)
-        x = torch.randn(1, 4, 32)
-        out = norm(x)
-        # With scale=0, effective scale=1, so should be close to plain RMS norm
-        rms = x.float().pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
-        expected = (x.float() * rms).to(x.dtype)
-        assert torch.allclose(out, expected, atol=1e-5)
-
-    def test_scale_plus_one_false(self):
-        """scale_plus_one=False: param init 1 → effective scale 1."""
-        norm = RMSNorm(32, scale_plus_one=False)
+    def test_default_weight_init(self):
+        norm = RMSNorm(32)
         x = torch.randn(1, 4, 32)
         out = norm(x)
         rms = x.float().pow(2).mean(-1, keepdim=True).add(1e-6).rsqrt()
@@ -40,18 +30,21 @@ class TestRMSNorm:
 
     def test_no_scale(self):
         norm = RMSNorm(16, with_scale=False)
-        assert norm.scale is None
+        assert norm.weight is None
         x = torch.randn(2, 4, 16)
         out = norm(x)
         assert out.shape == x.shape
 
     def test_zero_init(self):
         norm = RMSNorm(16, zero_init=True)
-        # zero_init means scale param is all zeros
-        assert (norm.scale == 0).all()
+        assert (norm.weight == 0).all()
+
+    def test_vision_rms_norm_zero_init(self):
+        norm = VisionRMSNorm(16)
+        assert (norm.weight == 0).all()
 
     def test_dtype_preservation(self):
-        norm = RMSNorm(32, scale_plus_one=False).to(torch.bfloat16)
+        norm = RMSNorm(32).to(torch.bfloat16)
         x = torch.randn(1, 4, 32, dtype=torch.bfloat16)
         out = norm(x)
         assert out.dtype == torch.bfloat16
