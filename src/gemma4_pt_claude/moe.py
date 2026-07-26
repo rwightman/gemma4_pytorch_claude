@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .layers import RMSNorm, TanhGELU
-from .module_utils import InitModule, factory_kwargs
+from .module_utils import DEFAULT_INIT_STD, InitModule, factory_kwargs
 
 
 class MoERouter(InitModule):
@@ -22,7 +22,7 @@ class MoERouter(InitModule):
             features: int,
             num_experts: int,
             top_k: int,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             *,
             device: torch.device | str | None = None,
             dtype: torch.dtype | None = None,
@@ -72,7 +72,7 @@ class MoEExperts(InitModule):
             num_experts: int,
             features: int,
             expert_dim: int,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             residual_init_std: float | None = None,
             *,
             device: torch.device | str | None = None,
@@ -103,7 +103,13 @@ class MoEExperts(InitModule):
             weights: torch.Tensor,
             expert_indices: torch.Tensor,
     ) -> torch.Tensor:
-        """
+        """Dispatch each token to its top-k experts.
+
+        Tokens are grouped by expert so each expert runs one dense GEMM over its
+        assigned rows.  Gathering the *weights* per token instead (``gate_up[ids]``)
+        would materialise a ``[tokens, D, 2*expert_dim]`` tensor — tens of GB at
+        26B-A4B dimensions for a normal prompt.
+
         Args:
             x: ``[B, L, D]``
             weights: ``[B, L, K]`` — normalised routing weights
@@ -115,34 +121,36 @@ class MoEExperts(InitModule):
         B, L, D = x.shape
         K = weights.shape[-1]
 
-        # Flatten to [B*L, D]
-        x_flat = x.reshape(-1, D)
-        wi_flat = expert_indices.reshape(-1, K)  # [B*L, K]
-        ww_flat = weights.reshape(-1, K)          # [B*L, K]
+        x_flat = x.reshape(-1, D)                            # [T, D]
+        flat_idx = expert_indices.reshape(-1)                # [T*K]
+        num_slots = flat_idx.shape[0]
 
-        # Accumulate expert outputs
-        out = torch.zeros_like(x_flat)  # [B*L, D]
+        # Sort assignments by expert; `order` maps sorted slot -> original slot.
+        order = torch.argsort(flat_idx, stable=True)
+        token_of_slot = torch.div(order, K, rounding_mode="floor")  # [T*K]
 
-        for k_idx in range(K):
-            expert_ids = wi_flat[:, k_idx]         # [B*L]
-            w = ww_flat[:, k_idx].unsqueeze(-1)    # [B*L, 1]
+        y_sorted = x_flat.new_empty(num_slots, D)
+        scale_sorted = x_flat.new_empty(num_slots)
 
-            # Gather per-token expert weights
-            gu = self.gate_up[expert_ids]   # [B*L, D, 2*H]
-            dw = self.down[expert_ids]       # [B*L, H, D]
+        experts, counts = torch.unique_consecutive(flat_idx[order], return_counts=True)
+        start = 0
+        for expert_id, count in zip(experts.tolist(), counts.tolist()):
+            span = slice(start, start + count)
+            start += count
 
-            # gate_up projection
-            h = torch.bmm(x_flat.unsqueeze(1), gu).squeeze(1)  # [B*L, 2*H]
-            gate, up = h.chunk(2, dim=-1)
-            act = self.act(gate) * up  # [B*L, H]
+            rows = x_flat[token_of_slot[span]]                       # [count, D]
+            gate, up = (rows @ self.gate_up[expert_id]).chunk(2, dim=-1)
+            y_sorted[span] = (self.act(gate) * up) @ self.down[expert_id]
+            scale_sorted[span] = self.per_expert_scale[expert_id]
 
-            # down projection
-            y = torch.bmm(act.unsqueeze(1), dw).squeeze(1)  # [B*L, D]
+        # Undo the sort, then combine the K expert outputs for each token.
+        y = torch.empty_like(y_sorted)
+        y[order] = y_sorted
+        scale = torch.empty_like(scale_sorted)
+        scale[order] = scale_sorted
 
-            # Per-expert scale
-            es = self.per_expert_scale[expert_ids].unsqueeze(-1)  # [B*L, 1]
-            out = out + w * es * y
-
+        combine = weights.reshape(-1, K) * scale.view(-1, K)         # [T, K]
+        out = (y.view(-1, K, D) * combine.unsqueeze(-1)).sum(dim=1)
         return out.reshape(B, L, D)
 
 
@@ -159,7 +167,7 @@ class MoELayer(InitModule):
             num_experts: int,
             top_k: int,
             expert_dim: int,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             residual_init_std: float | None = None,
             *,
             device: torch.device | str | None = None,

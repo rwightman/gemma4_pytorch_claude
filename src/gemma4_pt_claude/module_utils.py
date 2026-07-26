@@ -5,6 +5,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+# Default weight-init standard deviation, matching ``TextConfig.init_std``.
+# Modules take this as a default so they stay constructible standalone.
+DEFAULT_INIT_STD = 1e-2
+
 
 @dataclass
 class InitContext:

@@ -1,12 +1,10 @@
 """Unit tests for configuration and factory functions."""
 
-import pytest
+import torch
 
 from gemma4_pt_claude.config import (
     AttentionType,
-    Gemma4Config,
     KVCacheSharingConfig,
-    TextConfig,
     build_kv_sharing_patterns,
     make_attention_pattern,
 )
@@ -68,10 +66,15 @@ class TestKVSharing:
 
 
 class TestFactoryConfigs:
-    """Verify factory configs match JAX reference values."""
+    """Verify factory configs match JAX reference values.
+
+    Built on the meta device: these only inspect config and module structure, and
+    materializing 31B of real parameters just to read `cfg` took minutes.
+    """
 
     def test_e2b_config(self):
-        m = gemma4_e2b(text_only=True)
+        with torch.device("meta"):
+            m = gemma4_e2b(text_only=True)
         cfg = m.cfg.text
         assert cfg.num_layers == 35
         assert cfg.embed_dim == 1536
@@ -86,7 +89,8 @@ class TestFactoryConfigs:
         assert cfg.override_kv_shared_ffw_hidden == 12288  # 1536 * 4 * 2
 
     def test_e4b_config(self):
-        m = gemma4_e4b(text_only=True)
+        with torch.device("meta"):
+            m = gemma4_e4b(text_only=True)
         cfg = m.cfg.text
         assert cfg.num_layers == 42
         assert cfg.embed_dim == 2560
@@ -102,7 +106,8 @@ class TestFactoryConfigs:
         assert abs(cfg.kv_sharing.frac_shared_layers - 18.0 / 42) < 1e-6
 
     def test_31b_config(self):
-        m = gemma4_31b(text_only=True)
+        with torch.device("meta"):
+            m = gemma4_31b(text_only=True)
         cfg = m.cfg.text
         assert cfg.num_layers == 60
         assert cfg.embed_dim == 5376
@@ -115,7 +120,8 @@ class TestFactoryConfigs:
         assert cfg.kv_sharing is None  # no sharing for 31B
 
     def test_26b_a4b_config(self):
-        m = gemma4_26b_a4b(text_only=True)
+        with torch.device("meta"):
+            m = gemma4_26b_a4b(text_only=True)
         cfg = m.cfg.text
         assert cfg.num_layers == 30
         assert cfg.embed_dim == 2816
@@ -130,11 +136,13 @@ class TestFactoryConfigs:
         assert cfg.k_eq_v_global is True
 
     def test_text_only_no_vision(self):
-        m = gemma4_e2b(text_only=True)
+        with torch.device("meta"):
+            m = gemma4_e2b(text_only=True)
         assert m.vision_encoder is None
         assert m.audio_encoder is None
 
     def test_with_vision(self):
-        m = gemma4_e2b(text_only=False)
+        with torch.device("meta"):
+            m = gemma4_e2b(text_only=False)
         assert m.vision_encoder is not None
         assert m.audio_encoder is not None

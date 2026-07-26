@@ -7,6 +7,8 @@ Public API exports for model construction, configuration, and generation.
 from .config import (
     AttentionType,
     AudioConfig,
+    EncoderFreeAudioConfig,
+    EncoderFreeVisionConfig,
     Gemma4Config,
     KVCacheSharingConfig,
     MoEConfig,
@@ -18,7 +20,7 @@ from .config import (
 
 # Core modules
 from .layers import TanhGELU, RMSNorm, VisionRMSNorm, GatedMLP, ClippedLinear, apply_rope, apply_multidimensional_rope
-from .attention import Attention, LayerCache
+from .attention import Attention, LayerCache, cache_offset, create_sliding_mask
 from .moe import MoELayer, MoERouter, MoEExperts
 from .transformer import TextDecoder, TransformerBlock, Embedder
 from .vision_encoder import (
@@ -30,8 +32,13 @@ from .vision_encoder import (
     VisionPooler,
 )
 from .audio_encoder import AudioEncoder
-from .image_processing import preprocess_image, preprocess_images
-from .audio_processing import preprocess_audio, extract_mel_spectrogram
+from .encoder_free import (
+    EncoderFreeAudioEmbedder,
+    EncoderFreeVisionEmbedder,
+    MultimodalProjection,
+)
+from .image_processing import merge_patches, preprocess_image, preprocess_images
+from .audio_processing import preprocess_audio, extract_mel_spectrogram, frame_waveform
 from .composer import (
     Composer,
     ComposedInput,
@@ -49,13 +56,13 @@ from .model import Gemma4Model, VisionEmbedder, AudioEmbedder
 from .generate import generate, init_cache, chat
 
 # Factory functions
-from .factory import gemma4_e2b, gemma4_e4b, gemma4_31b, gemma4_26b_a4b
+from .factory import gemma4_e2b, gemma4_e4b, gemma4_12b, gemma4_31b, gemma4_26b_a4b
 
 # Tokenizer
 from .tokenizer import Gemma4Tokenizer
 
 # Weight loading
-from .load import load_weights, load_weights_streaming
+from .load import from_pretrained, load_weights, load_weights_streaming
 
 # Version
 from .version import __version__
@@ -64,6 +71,8 @@ __all__ = [
     # Configs
     "AttentionType",
     "AudioConfig",
+    "EncoderFreeAudioConfig",
+    "EncoderFreeVisionConfig",
     "Gemma4Config",
     "InitContext",
     "KVCacheSharingConfig",
@@ -83,6 +92,8 @@ __all__ = [
     # Attention
     "Attention",
     "LayerCache",
+    "cache_offset",
+    "create_sliding_mask",
     # MoE
     "MoELayer",
     "MoERouter",
@@ -99,12 +110,17 @@ __all__ = [
     "VisionBlock",
     "VisionPooler",
     "AudioEncoder",
+    "EncoderFreeVisionEmbedder",
+    "EncoderFreeAudioEmbedder",
+    "MultimodalProjection",
     # Image processing
+    "merge_patches",
     "preprocess_image",
     "preprocess_images",
     # Audio processing
     "preprocess_audio",
     "extract_mel_spectrogram",
+    "frame_waveform",
     # Composer
     "Composer",
     "ComposedInput",
@@ -123,11 +139,13 @@ __all__ = [
     # Factory
     "gemma4_e2b",
     "gemma4_e4b",
+    "gemma4_12b",
     "gemma4_31b",
     "gemma4_26b_a4b",
     # Tokenizer
     "Gemma4Tokenizer",
     # Weight loading
+    "from_pretrained",
     "load_weights",
     "load_weights_streaming",
     # Version

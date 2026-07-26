@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,7 +43,15 @@ class RMSNorm(nn.RMSNorm):
 
 
 class VisionRMSNorm(RMSNorm):
-    """Vision RMSNorm with zero-initialized affine weight."""
+    """RMSNorm used by the vision tower.
+
+    Gemma 4 norms are multiplicative (``x_normed * weight``) with a
+    one-initialized scale — unlike Gemma 3, whose norms apply
+    ``x_normed * (1 + weight)`` around a zero-initialized scale.  Initializing
+    this weight to zero would make every vision block an exact identity with
+    permanently zero gradients, so the scale is one-initialized like all other
+    Gemma 4 norms.
+    """
 
     def __init__(
             self,
@@ -59,7 +65,7 @@ class VisionRMSNorm(RMSNorm):
             dim,
             eps=eps,
             with_scale=True,
-            zero_init=True,
+            zero_init=False,
             device=device,
             dtype=dtype,
         )

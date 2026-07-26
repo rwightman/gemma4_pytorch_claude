@@ -16,11 +16,17 @@ Usage::
 
 from __future__ import annotations
 
+import json
+import logging
+import warnings
 from pathlib import Path
+
 import torch
 from safetensors import safe_open
 
 from .model import Gemma4Model
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +40,7 @@ def _hf_key_to_ours(
         has_vision: bool = False,
         has_audio: bool = False,
         use_clipped_vision: bool | None = None,
+        encoder_free: bool = False,
 ) -> str | None:
     """Map a single HF key to our naming convention.
 
@@ -68,9 +75,28 @@ def _hf_key_to_ours(
     # --- Multimodal embedder (vision) ---
     if has_vision:
         if k == "embed_vision.embedding_projection.weight":
-            return "embed_vision.proj.weight"
+            # Encoder-free variants nest the projection inside the embedder.
+            return (
+                "vision_embedder.multimodal_projection.proj.weight"
+                if encoder_free
+                else "embed_vision.proj.weight"
+            )
         if k == "embed_vision.embedding_pre_projection_norm.weight":
             return None  # with_scale=False → no weight parameter
+
+    # --- Encoder-free vision embedder (12B / gemma4_unified) ---
+    if encoder_free and k.startswith("vision_embedder."):
+        suffix = k[len("vision_embedder."):]
+        _ef_vision = {
+            "patch_ln1.weight", "patch_ln1.bias",
+            "patch_dense.weight", "patch_dense.bias",
+            "patch_ln2.weight", "patch_ln2.bias",
+            "pos_embedding",
+            "pos_norm.weight", "pos_norm.bias",
+        }
+        if suffix in _ef_vision:
+            return f"vision_embedder.{suffix}"
+        return None
 
     # --- Vision tower ---
     if k.startswith("vision_tower.") and has_vision:
@@ -154,7 +180,11 @@ def _hf_key_to_ours(
     # --- Multimodal embedder (audio) ---
     if has_audio:
         if k == "embed_audio.embedding_projection.weight":
-            return "embed_audio.proj.weight"
+            return (
+                "audio_embedder.multimodal_projection.proj.weight"
+                if encoder_free
+                else "embed_audio.proj.weight"
+            )
         if k == "embed_audio.embedding_pre_projection_norm.weight":
             return None  # with_scale=False → no weight parameter
 
@@ -389,6 +419,7 @@ def _hf_convert_weights(
         has_vision: bool = False,
         has_audio: bool = False,
         use_clipped_vision: bool | None = None,
+        encoder_free: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Convert HF safetensors keys to our naming, merging gate/up projections."""
     mapped: dict[str, torch.Tensor] = {}
@@ -423,6 +454,7 @@ def _hf_convert_weights(
             has_vision=has_vision,
             has_audio=has_audio,
             use_clipped_vision=use_clipped_vision,
+            encoder_free=encoder_free,
         )
         if our_key is not None:
             if hf_key.endswith(".experts.down_proj") or hf_key.endswith(".experts.gate_up_proj"):
@@ -444,7 +476,7 @@ def _hf_convert_weights(
         mapped[our_key] = fused
 
     if skipped:
-        print(f"Skipped {len(skipped)} HF keys: {skipped[:10]}...")
+        logger.debug("Skipped %d HF keys: %s...", len(skipped), skipped[:10])
 
     return mapped
 
@@ -551,11 +583,12 @@ def _stream_hf_weights_into_model(
 
     num_layers = model.cfg.text.num_layers
     has_moe = model.cfg.text.moe is not None
-    has_vision = model.vision_encoder is not None
-    has_audio = model.audio_encoder is not None
+    has_vision = model.vision_encoder is not None or model.vision_embedder is not None
+    has_audio = model.audio_encoder is not None or model.audio_embedder is not None
+    encoder_free = model.cfg.is_encoder_free
     use_clipped_vision = (
         model.cfg.vision.use_clipped_linear
-        if has_vision and model.cfg.vision is not None
+        if has_vision and not encoder_free and model.cfg.vision is not None
         else None
     )
 
@@ -587,6 +620,7 @@ def _stream_hf_weights_into_model(
                     has_vision=has_vision,
                     has_audio=has_audio,
                     use_clipped_vision=use_clipped_vision,
+                    encoder_free=encoder_free,
                 )
                 if mapped_key is None:
                     skipped.append(hf_key)
@@ -621,7 +655,7 @@ def _stream_hf_weights_into_model(
         _copy_mapped_tensor(dest_tensors, missing, mapped_key, fused)
 
     if skipped:
-        print(f"Skipped {len(skipped)} HF keys: {skipped[:10]}...")
+        logger.debug("Skipped %d HF keys: %s...", len(skipped), skipped[:10])
 
     model.init_non_persistent_buffers()
     return sorted(missing), unexpected
@@ -671,6 +705,37 @@ def _remap_legacy_scale_keys(
 
 
 # ---------------------------------------------------------------------------
+# Result reporting
+# ---------------------------------------------------------------------------
+
+def _report_load_result(
+        missing: list[str],
+        unexpected: list[str],
+        strict: bool,
+) -> None:
+    """Raise (strict) or warn about a partial load.
+
+    Missing keys are the dangerous direction: those parameters keep whatever
+    they were initialized with, so a variant/checkpoint mismatch would otherwise
+    silently produce a partly-random model.
+    """
+    if strict and (missing or unexpected):
+        raise RuntimeError(
+            f"Strict load failed with missing={missing[:8]} unexpected={unexpected[:8]}"
+        )
+    if missing:
+        warnings.warn(
+            f"{len(missing)} parameters were not present in the checkpoint and keep their "
+            f"initial values, e.g. {missing[:5]}. This usually means the model variant does "
+            f"not match the checkpoint. Pass strict=True to make this an error.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    if unexpected:
+        logger.info("%d checkpoint keys had no destination, e.g. %s", len(unexpected), unexpected[:5])
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -687,6 +752,8 @@ def load_weights_streaming(
 
     Unlike ``load_weights()``, this avoids building a full in-memory raw dict
     and a second remapped dict before materializing the model.
+
+    Missing keys raise when ``strict`` is True and warn otherwise.
     """
     if format == "auto":
         format = _detect_format_from_path(path)
@@ -700,12 +767,9 @@ def load_weights_streaming(
     else:
         raise ValueError(f"Unsupported format: {format}. Expected 'auto', 'hf', or 'ours'.")
 
-    if strict and (missing or unexpected):
-        raise RuntimeError(
-            f"Strict load failed with missing={missing[:8]} unexpected={unexpected[:8]}"
-        )
-
+    _report_load_result(missing, unexpected, strict)
     return missing, unexpected
+
 
 def load_weights(
         model: Gemma4Model,
@@ -723,7 +787,8 @@ def load_weights(
         path: Path to a ``.safetensors`` file, or a directory containing them.
         format: ``"auto"`` (detect), ``"ours"`` (our naming), or ``"hf"``
             (HuggingFace naming).
-        strict: If True, raise on missing/unexpected keys.
+        strict: If True, raise on missing/unexpected keys.  Otherwise missing
+            keys warn — they keep their initial (often random) values.
         dtype: Cast all loaded tensors to this dtype (e.g. ``torch.bfloat16``).
         device: Optional materialization device for models initialized on ``meta``.
 
@@ -743,17 +808,19 @@ def load_weights(
     if format == "hf":
         num_layers = model.cfg.text.num_layers
         has_moe = model.cfg.text.moe is not None
-        has_vision = model.vision_encoder is not None
-        has_audio = model.audio_encoder is not None
+        encoder_free = model.cfg.is_encoder_free
+        has_vision = model.vision_encoder is not None or model.vision_embedder is not None
+        has_audio = model.audio_encoder is not None or model.audio_embedder is not None
         raw = _hf_convert_weights(
             raw,
             num_layers,
             has_moe=has_moe,
             has_vision=has_vision,
             has_audio=has_audio,
+            encoder_free=encoder_free,
             use_clipped_vision=(
                 model.cfg.vision.use_clipped_linear
-                if has_vision and model.cfg.vision is not None
+                if has_vision and not encoder_free and model.cfg.vision is not None
                 else None
             ),
         )
@@ -783,4 +850,110 @@ def load_weights(
     model.init_non_persistent_buffers()
     missing = list(result.missing_keys) if hasattr(result, "missing_keys") else []
     unexpected = list(result.unexpected_keys) if hasattr(result, "unexpected_keys") else []
+    # strict=True already raised inside load_state_dict; this only warns.
+    _report_load_result(missing, unexpected, strict=False)
     return missing, unexpected
+
+
+# ---------------------------------------------------------------------------
+# from_pretrained
+# ---------------------------------------------------------------------------
+
+# (num_layers, embed_dim) → factory name, keyed off the HF text config.
+_VARIANT_BY_SHAPE = {
+    (35, 1536): "gemma4_e2b",
+    (42, 2560): "gemma4_e4b",
+    (48, 3840): "gemma4_12b",
+    (60, 5376): "gemma4_31b",
+    (30, 2816): "gemma4_26b_a4b",
+}
+
+
+def _read_hf_config(path: Path) -> dict | None:
+    config_path = path / "config.json" if path.is_dir() else path.parent / "config.json"
+    if not config_path.exists():
+        return None
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def _detect_variant(hf_config: dict) -> str:
+    """Pick the factory whose shape matches an HF ``config.json``."""
+    text = hf_config.get("text_config", hf_config)
+    num_layers = text.get("num_hidden_layers")
+    embed_dim = text.get("hidden_size")
+    variant = _VARIANT_BY_SHAPE.get((num_layers, embed_dim))
+    if variant is None:
+        raise ValueError(
+            f"Could not match config.json (num_hidden_layers={num_layers}, "
+            f"hidden_size={embed_dim}) to a known Gemma 4 variant "
+            f"{sorted(_VARIANT_BY_SHAPE.values())}. Pass variant=... explicitly."
+        )
+    return variant
+
+
+def from_pretrained(
+        path: str | Path,
+        *,
+        variant: str | None = None,
+        text_only: bool | None = None,
+        dtype: torch.dtype | None = None,
+        device: str | torch.device | None = None,
+        format: str = "auto",
+        strict: bool = True,
+) -> Gemma4Model:
+    """Build the right variant for a checkpoint and stream the weights into it.
+
+    Reads ``config.json`` next to the weights to pick the model variant and to
+    decide whether the vision/audio towers are present, constructs the model on
+    the meta device, then streams the checkpoint straight into it.
+
+    Args:
+        path: HF model directory, or a ``.safetensors`` file with a sibling
+            ``config.json``.
+        variant: Override variant detection (``"gemma4_e2b"``, ``"gemma4_e4b"``,
+            ``"gemma4_31b"``, ``"gemma4_26b_a4b"``).  Required when there is no
+            ``config.json``.
+        text_only: Skip the vision/audio towers.  Defaults to whatever the
+            checkpoint config declares.
+        dtype: Model dtype (e.g. ``torch.bfloat16``).
+        device: Device to materialize on.
+        format: ``"auto"``, ``"hf"``, or ``"ours"``.
+        strict: Raise if any parameter is missing from the checkpoint.  Unlike
+            the lower-level loaders this defaults to True, so a variant mismatch
+            fails loudly instead of leaving random weights in place.
+
+    Returns:
+        A ``Gemma4Model`` in eval mode with weights loaded.
+    """
+    from . import factory
+
+    resolved = Path(path)
+    hf_config = _read_hf_config(resolved)
+
+    if variant is None:
+        if hf_config is None:
+            raise ValueError(
+                f"No config.json found for {resolved}; pass variant=... explicitly."
+            )
+        variant = _detect_variant(hf_config)
+
+    if text_only is None:
+        text_only = bool(hf_config) and not (
+            hf_config.get("vision_config") or hf_config.get("audio_config")
+        )
+
+    build = getattr(factory, variant, None)
+    if build is None:
+        raise ValueError(
+            f"Unknown variant {variant!r}; expected one of {sorted(_VARIANT_BY_SHAPE.values())}."
+        )
+
+    with torch.device("meta"):
+        model = build(text_only=text_only)
+
+    load_weights_streaming(
+        model, resolved, format=format, dtype=dtype, device=device, strict=strict,
+    )
+    model.eval()
+    return model

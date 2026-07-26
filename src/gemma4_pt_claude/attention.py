@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .config import AttentionType
 from .layers import RMSNorm, apply_rope
-from .module_utils import InitModule, factory_kwargs
+from .module_utils import DEFAULT_INIT_STD, InitModule, factory_kwargs
 
 K_MASK = -2.3819763e38
 
@@ -20,11 +20,26 @@ K_MASK = -2.3819763e38
 # ---------------------------------------------------------------------------
 
 class LayerCache(TypedDict):
-    k: torch.Tensor       # [B, cache_len, kv_heads, head_dim]
-    v: torch.Tensor       # [B, cache_len, kv_heads, head_dim]
+    k: torch.Tensor          # [B, cache_len, kv_heads, head_dim]
+    v: torch.Tensor          # [B, cache_len, kv_heads, head_dim]
     positions: torch.Tensor  # [B, cache_len]
     end_index: torch.Tensor  # [B]
     valid_mask: torch.Tensor  # [B, cache_len] bool — True for filled slots
+    offset: int              # host-side fill level (avoids a device sync per layer)
+    rolling: bool            # True → writes may wrap and evict the oldest slots
+
+
+def cache_offset(cache: LayerCache) -> int:
+    """Host-side fill level of *cache*.
+
+    Prefers the plain-int ``offset`` entry so the decode loop does not pay a
+    device synchronization per layer; falls back to ``end_index`` for caches
+    built by older code.
+    """
+    offset = cache.get("offset")
+    if offset is None:
+        return int(cache["end_index"].reshape(-1)[0].item())
+    return int(offset)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +61,39 @@ def create_sliding_mask(
 
 
 # ---------------------------------------------------------------------------
+# Bidirectional (image-span) mask
+# ---------------------------------------------------------------------------
+
+def bidirectional_block_ids(bidirectional_mask: torch.Tensor) -> torch.Tensor:
+    """Number each contiguous True run in ``[B, L]`` with a unique id (0 = none)."""
+    padded = F.pad(bidirectional_mask.long(), (1, 0), value=0)
+    boundary = padded[:, 1:] > padded[:, :-1]        # rising edges
+    return bidirectional_mask.long() * boundary.long().cumsum(dim=-1)
+
+
+def create_bidirectional_mask(
+        positions: torch.Tensor,
+        key_positions: torch.Tensor,
+        bidirectional_mask: torch.Tensor,
+) -> torch.Tensor:
+    """``[B, L, S]`` bool — True where query and key share a bidirectional span.
+
+    Works for both the cacheless path (``key_positions is positions``) and the
+    cached path, where the key axis is a KV-cache slot layout: keys are matched
+    to queries by absolute position, so the mask is independent of where a token
+    physically landed in the cache.
+    """
+    block_ids = bidirectional_block_ids(bidirectional_mask)          # [B, L]
+    same_token = key_positions[:, None, :] == positions[:, :, None]  # [B, L, S]
+    # Project query-side block ids onto the key axis (0 for keys not in this chunk).
+    key_blocks = torch.einsum(
+        "bls,bl->bs", same_token.to(torch.float32), block_ids.to(torch.float32)
+    ).round().long()
+    q_blocks = block_ids[:, :, None]
+    return (q_blocks == key_blocks[:, None, :]) & (q_blocks > 0)
+
+
+# ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------
 
@@ -63,7 +111,7 @@ class Attention(InitModule):
             num_kv_heads: int,
             head_dim: int,
             attn_type: AttentionType,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             residual_init_std: float | None = None,
             rope_base: int = 10_000,
             rope_scale_factor: float = 1.0,
@@ -146,7 +194,21 @@ class Attention(InitModule):
             batch_size: int,
             dtype: torch.dtype = torch.bfloat16,
             device: torch.device | str = "cpu",
+            rolling: bool = False,
     ) -> LayerCache:
+        """Allocate a KV cache for one layer.
+
+        Args:
+            cache_length: number of slots.
+            num_kv_heads: KV head count for this layer.
+            head_dim: head dimension for this layer.
+            batch_size: batch size.
+            dtype: cache dtype.
+            device: cache device.
+            rolling: when True, writes past the end wrap around and evict the
+                oldest slots.  Only valid for sliding-window layers whose
+                ``cache_length`` covers the window; otherwise an overflow raises.
+        """
         shape = (batch_size, cache_length, num_kv_heads, head_dim)
         return LayerCache(
             k=torch.zeros(shape, dtype=dtype, device=device),
@@ -154,7 +216,54 @@ class Attention(InitModule):
             positions=torch.zeros(batch_size, cache_length, dtype=torch.int32, device=device),
             end_index=torch.zeros(batch_size, dtype=torch.int32, device=device),
             valid_mask=torch.zeros(batch_size, cache_length, dtype=torch.bool, device=device),
+            offset=0,
+            rolling=rolling,
         )
+
+    def _write_cache(
+            self,
+            cache: LayerCache,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            positions: torch.Tensor,
+            start: int,
+    ) -> None:
+        """Write ``k``/``v``/``positions`` into *cache* at slot ``start``.
+
+        Raises when the write would overflow a non-rolling cache, rather than
+        silently evicting entries the attention still needs.
+        """
+        L = k.shape[1]
+        cache_len = cache["v"].shape[1]
+
+        if L > cache_len:
+            raise ValueError(
+                f"KV cache overflow: writing {L} tokens into a {cache_len}-slot cache. "
+                f"Allocate a cache of at least prompt_len + max_new_tokens slots."
+            )
+        if start + L > cache_len and not cache.get("rolling", False):
+            raise ValueError(
+                f"KV cache overflow: slot {start} + {L} tokens exceeds {cache_len} slots. "
+                f"Allocate a larger cache (cache_length >= prompt_len + max_new_tokens)."
+            )
+
+        idx = start % cache_len
+        end = idx + L
+        if end <= cache_len:
+            slices = ((slice(idx, end), slice(0, L)),)
+        else:
+            # Rolling cache: split the write across the buffer boundary.
+            head = cache_len - idx
+            slices = (
+                (slice(idx, cache_len), slice(0, head)),
+                (slice(0, L - head), slice(head, L)),
+            )
+
+        for dst, src in slices:
+            cache["k"][:, dst] = k[:, src].to(cache["k"].dtype)
+            cache["v"][:, dst] = v[:, src].to(cache["v"].dtype)
+            cache["positions"][:, dst] = positions[:, src].to(cache["positions"].dtype)
+            cache["valid_mask"][:, dst] = True
 
     # ---- forward ---------------------------------------------------------
 
@@ -162,17 +271,23 @@ class Attention(InitModule):
             self,
             x: torch.Tensor,
             positions: torch.Tensor,
-            attn_mask: torch.Tensor,
+            attn_mask: torch.Tensor | None = None,
             cache: LayerCache | None = None,
             shared_kv_cache: LayerCache | None = None,
+            bidirectional_mask: torch.Tensor | None = None,
     ) -> tuple[LayerCache | None, torch.Tensor]:
         """
         Args:
             x: ``[B, L, D]``
             positions: ``[B, L]``
-            attn_mask: ``[B, L, S]`` bool (True = attend)
+            attn_mask: ``[B, L, S]`` bool (True = attend).  When None a causal
+                mask is derived from ``positions`` and the cached key positions,
+                which is layout-independent and therefore also correct for
+                rolling caches.
             cache: optional KV cache for this layer
             shared_kv_cache: if not None, reuse KV from another layer
+            bidirectional_mask: ``[B, L]`` bool — tokens inside each contiguous
+                True span attend to each other regardless of causal order.
         """
         B, L, _ = x.shape
 
@@ -207,28 +322,30 @@ class Attention(InitModule):
         # --- KV cache update ---
         cache_positions = None
         valid_mask = None
+        start = 0
         if shared_kv_cache is not None:
             # Reuse positions from the layer we're sharing KV with
             cache_positions = shared_kv_cache.get("positions")
             valid_mask = shared_kv_cache.get("valid_mask")
         elif cache is not None:
-            # All batch elements must have the same end_index (single-batch
-            # decode or uniform-length batched decode). Assert to catch misuse.
-            end = cache["end_index"][0].item()
-            assert (cache["end_index"] == end).all(), (
-                "Heterogeneous batch end_index not supported; all batch "
-                "elements must have the same cache fill level"
-            )
-            cache_len = cache["v"].shape[1]
-            idx = end % cache_len
-            cache["k"][:, idx : idx + L] = k.to(cache["k"].dtype)
-            cache["v"][:, idx : idx + L] = v.to(cache["v"].dtype)
-            cache["positions"][:, idx : idx + L] = positions
-            cache["valid_mask"][:, idx : idx + L] = True
+            start = cache_offset(cache)
+            self._write_cache(cache, k, v, positions, start)
             k = cache["k"].to(q.dtype)
             v = cache["v"].to(q.dtype)
             cache_positions = cache["positions"]
             valid_mask = cache["valid_mask"]
+
+        # --- Attention mask ---
+        # Derive causally from positions when not supplied: this stays correct
+        # for rolling caches, where slot order does not track position order.
+        key_positions = cache_positions if cache_positions is not None else positions
+        if attn_mask is None:
+            attn_mask = key_positions[:, None, :] <= positions[:, :, None]
+
+        if bidirectional_mask is not None:
+            attn_mask = attn_mask | create_bidirectional_mask(
+                positions, key_positions, bidirectional_mask,
+            )
 
         # --- Mask out unfilled cache slots ---
         if valid_mask is not None:
@@ -264,11 +381,10 @@ class Attention(InitModule):
             # preserve the cache dtype (e.g. bfloat16) rather than the float32
             # copies used for attention computation.
             new_cache = {
-                "k": cache["k"] if shared_kv_cache is None else cache["k"],
-                "v": cache["v"] if shared_kv_cache is None else cache["v"],
+                **cache,
                 "end_index": cache["end_index"] + L,
+                "offset": start + L,
                 "positions": cache_positions if cache_positions is not None else cache["positions"],
-                "valid_mask": cache["valid_mask"],
             }
         elif shared_kv_cache is None:
             # Still return layer-sharing KV (vertical sharing)

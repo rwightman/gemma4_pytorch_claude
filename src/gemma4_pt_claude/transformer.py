@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 import torch.nn as nn
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 from .attention import Attention, LayerCache
 from .config import AttentionType, TextConfig, build_kv_sharing_patterns, make_attention_pattern
 from .layers import GatedMLP, RMSNorm, TanhGELU
-from .module_utils import InitModule, factory_kwargs, resolve_residual_init_std
+from .module_utils import DEFAULT_INIT_STD, InitModule, factory_kwargs, resolve_residual_init_std
 from .moe import MoELayer
 
 
@@ -118,7 +119,7 @@ class PerLayerMapping(InitModule):
             self,
             embed_dim: int,
             pli_dim: int,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             residual_init_std: float | None = None,
             *,
             device: torch.device | str | None = None,
@@ -298,15 +299,23 @@ class TransformerBlock(InitModule):
             self,
             x: torch.Tensor,
             positions: torch.Tensor,
-            attn_mask: torch.Tensor,
+            attn_mask: torch.Tensor | None = None,
             cache: LayerCache | None = None,
             shared_kv_cache: LayerCache | None = None,
             per_layer_input: torch.Tensor | None = None,
+            bidirectional_mask: torch.Tensor | None = None,
     ) -> tuple[LayerCache | None, torch.Tensor]:
         # --- Attention ---
         residual = x
         h = self.pre_attn_norm(x)
-        cache, h = self.attn(h, positions, attn_mask, cache=cache, shared_kv_cache=shared_kv_cache)
+        cache, h = self.attn(
+            h,
+            positions,
+            attn_mask,
+            cache=cache,
+            shared_kv_cache=shared_kv_cache,
+            bidirectional_mask=bidirectional_mask,
+        )
         if self.post_attn_norm is not None:
             h = self.post_attn_norm(h)
         x = residual + h
@@ -386,6 +395,17 @@ class TextDecoder(InitModule):
         attn_types = make_attention_pattern(cfg.attention_pattern, cfg.num_layers)
         self.attn_types = attn_types
 
+        if attn_types and attn_types[-1] != AttentionType.GLOBAL:
+            # Every released variant ends on a global layer so the final block
+            # can integrate the whole sequence before the logit projection.
+            warnings.warn(
+                f"Last decoder layer is {attn_types[-1].name}, not GLOBAL. "
+                f"num_layers={cfg.num_layers} does not tile the attention pattern "
+                f"(length {len(cfg.attention_pattern)}) onto a global final layer.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         # Build KV sharing patterns
         self.kv_sharing_patterns = build_kv_sharing_patterns(
             cfg.num_layers, attn_types, cfg.kv_sharing
@@ -422,20 +442,27 @@ class TextDecoder(InitModule):
             self,
             x: torch.Tensor,
             positions: torch.Tensor,
-            attn_mask: torch.Tensor,
+            attn_mask: torch.Tensor | None = None,
             per_layer_inputs: torch.Tensor | None = None,
             cache: dict[str, LayerCache] | None = None,
+            bidirectional_mask: torch.Tensor | None = None,
+            logits_to_keep: int = 0,
     ) -> tuple[torch.Tensor, dict[str, LayerCache] | None]:
         """
         Args:
             x: ``[B, L, D]`` — already-embedded tokens
             positions: ``[B, L]``
-            attn_mask: ``[B, L, S]`` bool
+            attn_mask: ``[B, L, S]`` bool, or None to derive a causal mask from
+                positions (required when layers have differently sized caches)
             per_layer_inputs: ``[B, L, num_layers, pli_dim]`` or None
             cache: dict mapping ``"layer_i"`` to LayerCache
+            bidirectional_mask: ``[B, L]`` bool — image spans to make bidirectional
+            logits_to_keep: only decode logits for the last N positions
+                (0 = all).  Generation only needs the final row, and the full
+                ``[B, L, 262144]`` tensor dominates prefill memory.
 
         Returns:
-            logits: ``[B, L, V]``
+            logits: ``[B, L', V]`` where ``L' = logits_to_keep or L``
             new_cache: updated cache dict (or None)
         """
         old_cache = cache or {}
@@ -461,6 +488,7 @@ class TextDecoder(InitModule):
                 cache=old_cache.get(layer_name),  # None for shared layers
                 shared_kv_cache=shared_kv,
                 per_layer_input=pli,
+                bidirectional_mask=bidirectional_mask,
             )
 
             if is_shared:
@@ -470,6 +498,8 @@ class TextDecoder(InitModule):
                 new_cache[layer_name] = layer_cache
 
         x = self.final_norm(x)
+        if logits_to_keep:
+            x = x[:, -logits_to_keep:]
         logits = self.embedder.decode_logits(x)
 
         # Final logit softcap

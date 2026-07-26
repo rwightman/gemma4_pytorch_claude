@@ -17,7 +17,7 @@ try:
 except ImportError:
     PILImage = None  # type: ignore[assignment, misc]
 
-from .config import VisionConfig
+from .config import EncoderFreeVisionConfig, VisionConfig
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +98,59 @@ def patchify(
 
 
 # ---------------------------------------------------------------------------
+# Patch merging (encoder-free variants)
+# ---------------------------------------------------------------------------
+
+def merge_patches(
+        patches: torch.Tensor,
+        position_ids: torch.Tensor,
+        output_length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Merge ``k x k`` spatially adjacent patches into single larger patches.
+
+    Encoder-free variants have no vision tower, so the spatial pooling the tower
+    models do *after* their encoder happens here instead: ``k x k`` groups of
+    ``patch_size`` patches become one ``k * patch_size`` patch.
+
+    Args:
+        patches: ``[L, patch_size**2 * 3]``.
+        position_ids: ``[L, 2]`` — (x, y) grid coords.
+        output_length: number of merged patches; ``L`` must equal
+            ``output_length * k**2``.
+
+    Returns:
+        ``(merged [output_length, (k*patch_size)**2 * 3], positions [output_length, 2])``
+    """
+    patch_dim = patches.shape[-1]
+    patch_size = math.isqrt(patch_dim // 3)
+    if patch_size * patch_size * 3 != patch_dim:
+        raise ValueError(f"Patch dim {patch_dim} is not patch_size**2 * 3")
+
+    k = math.isqrt(patches.shape[0] // output_length)
+    if k * k * output_length != patches.shape[0]:
+        raise ValueError(f"Cannot merge {patches.shape[0]} patches into {output_length}")
+
+    # Order patches so each k x k kernel is contiguous, in raster order within
+    # the kernel and raster order across kernels.
+    max_x = position_ids[..., 0].max() + 1
+    kernel_idx = torch.div(position_ids, k, rounding_mode="floor")
+    kernel_start = k * k * kernel_idx[..., 0] + k * max_x * kernel_idx[..., 1]
+    within = torch.remainder(position_ids, k)
+    order = (within[..., 0] + within[..., 1] * k + kernel_start).long().argsort()
+
+    ordered = patches[order]
+    # [L, p*p*3] -> [out, k, k, p, p, 3] -> [out, k, p, k, p, 3] -> [out, (k*p)**2*3]
+    ordered = ordered.reshape(output_length, k, k, patch_size, patch_size, 3)
+    ordered = ordered.permute(0, 1, 3, 2, 4, 5)
+    merged = ordered.reshape(output_length, (k * patch_size) ** 2 * 3)
+
+    # Merged position is the kernel index, i.e. the min coord in the group.
+    merged_positions = torch.div(position_ids[order], k, rounding_mode="floor")
+    merged_positions = merged_positions.reshape(output_length, k * k, 2).amin(dim=1)
+    return merged, merged_positions.to(torch.long)
+
+
+# ---------------------------------------------------------------------------
 # Padding
 # ---------------------------------------------------------------------------
 
@@ -129,26 +182,30 @@ def preprocess_image(
         patch_size: int,
         max_patches: int,
         pooling_kernel_size: int,
+        merge: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Preprocess a single image for the Gemma4 vision encoder.
+    """Preprocess a single image for the Gemma4 vision path.
 
     Args:
         image: PIL Image or ``[C, H, W]`` tensor.
         patch_size: patch side length.
         max_patches: maximum number of patches (from ``VisionConfig.max_patches``).
         pooling_kernel_size: spatial pooling kernel side.
+        merge: merge ``pooling_kernel_size`` square groups of patches into single
+            larger patches, for encoder-free variants that have no vision tower.
 
     Returns:
         ``(patches, position_ids, num_soft_tokens)`` where patches is
         ``[num_patches, patch_dim]``, position_ids is ``[num_patches, 2]``,
         and num_soft_tokens is the number of output tokens after pooling.
+        With ``merge=True`` there is exactly one patch per soft token.
     """
-    # Convert PIL to tensor
+    # Convert PIL to tensor (via the raw buffer, so numpy is not required)
     if PILImage is not None and isinstance(image, PILImage.Image):
         image = image.convert("RGB")
-        image = torch.from_numpy(
-            __import__("numpy").array(image)
-        ).permute(2, 0, 1).float() / 255.0
+        width, height = image.size
+        buffer = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
+        image = buffer.view(height, width, 3).permute(2, 0, 1).float() / 255.0
     elif isinstance(image, torch.Tensor):
         if image.dtype == torch.uint8:
             image = image.float() / 255.0
@@ -172,6 +229,9 @@ def preprocess_image(
 
     patches, position_ids = patchify(image, patch_size)
     num_soft_tokens = patches.shape[0] // (pooling_kernel_size ** 2)
+    if merge:
+        # Encoder-free variants pool before the projection, not after a tower.
+        patches, position_ids = merge_patches(patches, position_ids, num_soft_tokens)
     return patches, position_ids, num_soft_tokens
 
 
@@ -181,30 +241,35 @@ def preprocess_image(
 
 def preprocess_images(
         images: "Sequence[PILImage.Image | torch.Tensor]",
-        config: VisionConfig,
+        config: "VisionConfig | EncoderFreeVisionConfig",
 ) -> dict[str, torch.Tensor | list[int]]:
-    """Preprocess a batch of images for the Gemma4 vision encoder.
+    """Preprocess a batch of images for the Gemma4 vision path.
+
+    Handles both the tower configs and the encoder-free configs; for the latter
+    patches are merged and padded to ``output_length`` rather than ``max_patches``.
 
     Args:
         images: list of PIL Images or ``[C, H, W]`` tensors.
-        config: ``VisionConfig`` instance.
+        config: ``VisionConfig`` or ``EncoderFreeVisionConfig``.
 
     Returns:
         Dict with keys:
-        - ``pixel_values``: ``[B, max_patches, patch_dim]``
-        - ``image_position_ids``: ``[B, max_patches, 2]``
+        - ``pixel_values``: ``[B, num_patches, patch_dim]``
+        - ``image_position_ids``: ``[B, num_patches, 2]``
         - ``num_soft_tokens_per_image``: ``list[int]``
     """
+    merge = isinstance(config, EncoderFreeVisionConfig)
     max_patches = config.max_patches
+    pad_length = config.output_length if merge else max_patches
     all_patches = []
     all_position_ids = []
     num_soft_tokens_per_image = []
 
     for img in images:
         patches, pos_ids, n_soft = preprocess_image(
-            img, config.patch_size, max_patches, config.pooling_kernel_size,
+            img, config.patch_size, max_patches, config.pooling_kernel_size, merge=merge,
         )
-        patches, pos_ids = pad_to_max_patches(patches, pos_ids, max_patches)
+        patches, pos_ids = pad_to_max_patches(patches, pos_ids, pad_length)
         all_patches.append(patches)
         all_position_ids.append(pos_ids)
         num_soft_tokens_per_image.append(n_soft)

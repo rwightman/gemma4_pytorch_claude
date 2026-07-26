@@ -29,7 +29,13 @@ try:
 except ImportError:
     PILImage = None  # type: ignore[assignment, misc]
 
-from .config import AudioConfig, Gemma4Config, VisionConfig
+from .config import (
+    AudioConfig,
+    EncoderFreeAudioConfig,
+    EncoderFreeVisionConfig,
+    Gemma4Config,
+    VisionConfig,
+)
 from .image_processing import pad_to_max_patches, preprocess_image
 from .tokenizer import Gemma4Tokenizer
 
@@ -49,11 +55,17 @@ class PreparedImage:
 
 @dataclass
 class PreparedAudio:
-    """Result of transforming a single audio waveform for the audio encoder."""
+    """Result of transforming a single audio waveform for the audio path.
 
-    audio_mel: torch.Tensor       # [T, 128] log-mel spectrogram
-    audio_mel_mask: torch.Tensor  # [T] bool — True for valid frames
-    num_soft_tokens: int          # number of placeholder tokens to insert
+    Tower variants populate ``audio_mel``; encoder-free variants populate
+    ``audio_frames`` with raw waveform chunks instead.
+    """
+
+    audio_mel: torch.Tensor | None       # [T, 128] log-mel spectrogram
+    audio_mel_mask: torch.Tensor | None  # [T] bool — True for valid frames
+    num_soft_tokens: int                 # number of placeholder tokens to insert
+    audio_frames: torch.Tensor | None = None      # [T, samples_per_token] raw frames
+    audio_frame_mask: torch.Tensor | None = None  # [T] bool — True for valid frames
 
 
 @dataclass
@@ -68,6 +80,8 @@ class ComposedInput:
     audio_mel_mask: torch.Tensor | None       # [B, T] bool
     audio_mask: torch.Tensor | None           # [B, L] bool — True at audio placeholder positions
     audio_num_soft_tokens: torch.Tensor | None  # [B_audio] int
+    audio_frames: torch.Tensor | None = None       # [B, T, samples] encoder-free audio
+    audio_frame_mask: torch.Tensor | None = None   # [B, T] bool
 
     def to_model_kwargs(
             self,
@@ -89,6 +103,10 @@ class ComposedInput:
             out["audio_mask"] = self.audio_mask
         if self.audio_num_soft_tokens is not None:
             out["audio_num_soft_tokens"] = self.audio_num_soft_tokens
+        if self.audio_frames is not None:
+            out["audio_frames"] = self.audio_frames
+        if self.audio_frame_mask is not None:
+            out["audio_frame_mask"] = self.audio_frame_mask
         if device is not None:
             out = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in out.items()}
         return out
@@ -103,18 +121,24 @@ class ImageTransform:
 
     Accepts a PIL Image or ``[C, H, W]`` tensor and returns a ``PreparedImage``.
     Handles uint8 rescaling internally (via ``preprocess_image``).
+
+    For encoder-free configs the patches are merged into one large patch per soft
+    token and padded to ``output_length`` instead of ``max_patches``.
     """
 
-    def __init__(self, config: VisionConfig):
+    def __init__(self, config: "VisionConfig | EncoderFreeVisionConfig"):
         self.patch_size = config.patch_size
         self.max_patches = config.max_patches
         self.pooling_kernel_size = config.pooling_kernel_size
+        self.merge = isinstance(config, EncoderFreeVisionConfig)
+        self.pad_length = config.output_length if self.merge else config.max_patches
 
     def __call__(self, image: "PILImage.Image | torch.Tensor") -> PreparedImage:
         patches, position_ids, num_soft_tokens = preprocess_image(
             image, self.patch_size, self.max_patches, self.pooling_kernel_size,
+            merge=self.merge,
         )
-        patches, position_ids = pad_to_max_patches(patches, position_ids, self.max_patches)
+        patches, position_ids = pad_to_max_patches(patches, position_ids, self.pad_length)
         return PreparedImage(
             pixel_values=patches,
             position_ids=position_ids,
@@ -154,9 +178,13 @@ class AudioTransform:
 
     TARGET_SAMPLE_RATE = 16_000
 
-    def __init__(self, config: AudioConfig, sample_rate: int = 16000):
+    def __init__(self, config: "AudioConfig | EncoderFreeAudioConfig", sample_rate: int = 16000):
         self.sample_rate = sample_rate
         self.max_seq_length = 750  # cap from JAX audio_seq_length
+        self.encoder_free = isinstance(config, EncoderFreeAudioConfig)
+        self.samples_per_token = (
+            config.audio_samples_per_token if self.encoder_free else 0
+        )
 
     def __call__(
             self,
@@ -172,7 +200,12 @@ class AudioTransform:
                 is resampled before mel extraction.  Defaults to the rate
                 passed at construction time.
         """
-        from .audio_processing import extract_mel_spectrogram, to_float32, to_mono_waveform
+        from .audio_processing import (
+            _require_torchaudio,
+            extract_mel_spectrogram,
+            to_float32,
+            to_mono_waveform,
+        )
 
         if sample_rate is None:
             sample_rate = self.sample_rate
@@ -183,12 +216,26 @@ class AudioTransform:
 
         # Resample to 16 kHz if needed
         if sample_rate != self.TARGET_SAMPLE_RATE:
+            _require_torchaudio()
             import torchaudio
             waveform = torchaudio.functional.resample(
                 waveform.unsqueeze(0), sample_rate, self.TARGET_SAMPLE_RATE,
             ).squeeze(0)
 
         num_samples = waveform.shape[0]
+
+        if self.encoder_free:
+            # No mel frontend: each fixed-size chunk of raw samples is one token.
+            from .audio_processing import frame_waveform
+
+            frames = frame_waveform(waveform, self.samples_per_token)
+            return PreparedAudio(
+                audio_mel=None,
+                audio_mel_mask=None,
+                num_soft_tokens=frames.shape[0],
+                audio_frames=frames,
+                audio_frame_mask=torch.ones(frames.shape[0], dtype=torch.bool),
+            )
 
         # Compute soft token count from 16 kHz sample count
         num_soft_tokens = min(
@@ -231,6 +278,21 @@ _AUDIO_SOFT_TOKEN = -4
 _DOUBLE_NEWLINE_TOKEN = 108
 
 
+def _pad_stack(
+        features: list[torch.Tensor],
+        masks: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Right-pad a list of ``[T, F]`` features (and ``[T]`` masks) and stack them."""
+    max_t = max(f.shape[0] for f in features)
+    padded_features = [
+        torch.nn.functional.pad(f, (0, 0, 0, max_t - f.shape[0])) for f in features
+    ]
+    padded_masks = [
+        torch.nn.functional.pad(m, (0, max_t - m.shape[0]), value=False) for m in masks
+    ]
+    return torch.stack(padded_features), torch.stack(padded_masks)
+
+
 def _broadcast_sample_rates(
         rates: list[int] | int | None,
         n: int,
@@ -253,11 +315,21 @@ class Composer:
     Args:
         tokenizer: A ``Gemma4Tokenizer`` instance.
         config: A ``Gemma4Config`` instance.
+        image_newline_wrap: Emit ``\\n\\n`` either side of each image block.
+            Gemma 3 / 3n wrap image blocks this way; Gemma 4 does not, so this
+            defaults to False to match the reference processor.  Set True only
+            to reproduce older behaviour.
     """
 
-    def __init__(self, tokenizer: Gemma4Tokenizer, config: Gemma4Config):
+    def __init__(
+            self,
+            tokenizer: Gemma4Tokenizer,
+            config: Gemma4Config,
+            image_newline_wrap: bool = False,
+    ):
         self.tokenizer = tokenizer
         self.config = config
+        self.image_newline_wrap = image_newline_wrap
         self.image_transform = ImageTransform(config.vision) if config.vision else None
         self.audio_transform = AudioTransform(config.audio) if config.audio else None
 
@@ -391,24 +463,26 @@ class Composer:
         audio_mel_mask = None
         audio_mask = None
         audio_num_soft_tokens = None
+        audio_frames = None
+        audio_frame_mask = None
 
         if prepared_audios:
-            # Pad mel spectrograms to same length for batching
-            max_t = max(p.audio_mel.shape[0] for p in prepared_audios)
-            padded_mels = []
-            padded_masks = []
-            for p in prepared_audios:
-                t = p.audio_mel.shape[0]
-                pad_len = max_t - t
-                padded_mels.append(torch.nn.functional.pad(p.audio_mel, (0, 0, 0, pad_len)))
-                padded_masks.append(torch.nn.functional.pad(p.audio_mel_mask, (0, pad_len), value=False))
-            audio_mel = torch.stack(padded_mels)           # [N_audio, T, 128]
-            audio_mel_mask = torch.stack(padded_masks)     # [N_audio, T]
             audio_mask = (input_ids == _AUDIO_SOFT_TOKEN)
             audio_num_soft_tokens = torch.tensor(
                 [p.num_soft_tokens for p in prepared_audios],
                 dtype=torch.long,
             )
+            if prepared_audios[0].audio_frames is not None:
+                # Encoder-free: pad raw frame stacks to a common length.
+                audio_frames, audio_frame_mask = _pad_stack(
+                    [p.audio_frames for p in prepared_audios],
+                    [p.audio_frame_mask for p in prepared_audios],
+                )
+            else:
+                audio_mel, audio_mel_mask = _pad_stack(
+                    [p.audio_mel for p in prepared_audios],
+                    [p.audio_mel_mask for p in prepared_audios],
+                )
 
         return ComposedInput(
             input_ids=input_ids,
@@ -419,6 +493,8 @@ class Composer:
             audio_mel_mask=audio_mel_mask,
             audio_mask=audio_mask,
             audio_num_soft_tokens=audio_num_soft_tokens,
+            audio_frames=audio_frames,
+            audio_frame_mask=audio_frame_mask,
         )
 
     def _expand_markers(
@@ -454,11 +530,13 @@ class Composer:
             pos = marker_pos + len(marker_type)
 
             if marker_type == _IMAGE_MARKER and img_idx < len(prepared_images):
-                ids.append(_DOUBLE_NEWLINE_TOKEN)
+                if self.image_newline_wrap:
+                    ids.append(_DOUBLE_NEWLINE_TOKEN)
                 ids.append(tok.START_OF_IMAGE)
                 ids.extend([_IMAGE_SOFT_TOKEN] * prepared_images[img_idx].num_soft_tokens)
                 ids.append(tok.END_OF_IMAGE)
-                ids.append(_DOUBLE_NEWLINE_TOKEN)
+                if self.image_newline_wrap:
+                    ids.append(_DOUBLE_NEWLINE_TOKEN)
                 img_idx += 1
             elif marker_type == _AUDIO_MARKER and aud_idx < len(prepared_audios):
                 ids.append(tok.START_OF_AUDIO)

@@ -71,6 +71,26 @@ class TestVisionPatchEmbedder:
         embedder = VisionPatchEmbedder(cfg)
         assert embedder.position_embedding_table.data.abs().max().item() == 0.0
 
+    def test_position_embedding_matches_one_hot_reference(self):
+        """The gather must equal the reference one-hot matmul exactly."""
+        cfg = _tiny_vision_config()
+        embedder = VisionPatchEmbedder(cfg)
+        embedder.init_weights()
+        B, L = 2, 6
+        position_ids = torch.randint(0, 8, (B, L, 2))
+        position_ids[:, -1] = -1
+        padding_mask = (position_ids == -1).all(dim=-1)
+
+        table = embedder.position_embedding_table
+        one_hot = torch.nn.functional.one_hot(
+            position_ids.clamp(min=0), num_classes=cfg.position_embedding_size,
+        ).permute(0, 2, 1, 3).to(table)
+        reference = (one_hot @ table).sum(dim=1)
+        reference = torch.where(padding_mask.unsqueeze(-1), 0.0, reference)
+
+        actual = embedder._position_embeddings(position_ids, padding_mask)
+        assert torch.equal(actual, reference)
+
 
 class TestVisionAttention:
     def test_output_shape(self):
@@ -93,6 +113,45 @@ class TestVisionAttention:
         pos_ids = torch.zeros(B, L, 2, dtype=torch.long)
         out = attn(x, mask, pos_ids)
         assert not torch.isnan(out).any()
+
+    def test_fully_masked_rows_stay_finite(self):
+        """Padding queries attend to nothing; the result must not be NaN."""
+        cfg = _tiny_vision_config()
+        attn = VisionAttention(cfg)
+        attn.init_weights()
+        B, L = 1, 4
+        x = torch.randn(B, L, cfg.d_model)
+        mask = torch.full((B, 1, L, L), torch.finfo(torch.float32).min)
+        pos_ids = torch.zeros(B, L, 2, dtype=torch.long)
+        out = attn(x, mask, pos_ids)
+        assert torch.isfinite(out).all()
+
+
+class TestVisionBlockInit:
+    def test_fresh_block_is_not_an_identity(self):
+        """Zero-initialized norms would make the whole tower untrainable."""
+        cfg = _tiny_vision_config()
+        block = VisionBlock(cfg, 0)
+        block.init_weights()
+        block.eval()
+        x = torch.randn(1, 6, cfg.d_model)
+        mask = torch.zeros(1, 1, 6, 6)
+        pos_ids = torch.zeros(1, 6, 2, dtype=torch.long)
+        with torch.no_grad():
+            out = block(x, mask, pos_ids)
+        assert not torch.equal(out, x)
+
+    def test_fresh_block_has_nonzero_gradients(self):
+        cfg = _tiny_vision_config()
+        block = VisionBlock(cfg, 0)
+        block.init_weights()
+        x = torch.randn(1, 6, cfg.d_model)
+        mask = torch.zeros(1, 1, 6, 6)
+        pos_ids = torch.zeros(1, 6, 2, dtype=torch.long)
+        block(x, mask, pos_ids).square().mean().backward()
+        grads = [p.grad for p in block.attn.parameters() if p.grad is not None]
+        assert grads, "attention received no gradients at all"
+        assert any(g.abs().max().item() > 0 for g in grads)
 
 
 class TestVisionMLP:

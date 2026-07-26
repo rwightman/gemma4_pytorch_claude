@@ -1,5 +1,6 @@
 """Unit tests for weight loading."""
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -10,12 +11,15 @@ from safetensors.torch import save_file
 from gemma4_pt_claude.config import AttentionType, AudioConfig, Gemma4Config, MoEConfig, TextConfig
 from gemma4_pt_claude.model import Gemma4Model
 from gemma4_pt_claude.load import (
+    from_pretrained,
     load_weights,
     load_weights_streaming,
+    _detect_variant,
     _hf_key_to_ours,
     _hf_convert_weights,
     _hf_vision_key_to_ours,
     _hf_audio_key_to_ours,
+    _read_hf_config,
 )
 
 
@@ -355,7 +359,12 @@ class TestLoadWeights:
 
             with torch.device("meta"):
                 meta_model = Gemma4Model(cfg)
-            missing, unexpected = load_weights_streaming(meta_model, path, format="hf", device="cpu")
+            # This fixture is a deliberately partial checkpoint, so a missing-key
+            # warning is expected.
+            with pytest.warns(RuntimeWarning, match="not present in the checkpoint"):
+                missing, unexpected = load_weights_streaming(
+                    meta_model, path, format="hf", device="cpu",
+                )
 
         assert unexpected == []
         fused = meta_model.state_dict()["text_decoder.blocks.0.ffw.gate_up_proj.weight"]
@@ -400,7 +409,12 @@ class TestLoadWeights:
 
             with torch.device("meta"):
                 meta_model = Gemma4Model(cfg)
-            missing, unexpected = load_weights_streaming(meta_model, path, format="hf", device="cpu")
+            # This fixture is a deliberately partial checkpoint, so a missing-key
+            # warning is expected.
+            with pytest.warns(RuntimeWarning, match="not present in the checkpoint"):
+                missing, unexpected = load_weights_streaming(
+                    meta_model, path, format="hf", device="cpu",
+                )
 
         assert unexpected == []
         sd = meta_model.state_dict()
@@ -539,3 +553,51 @@ class TestAudioKeyMapping:
             has_audio=True,
         )
         assert result == "embed_audio.proj.weight"
+
+
+# ---------------------------------------------------------------------------
+# from_pretrained — variant detection
+# ---------------------------------------------------------------------------
+
+class TestVariantDetection:
+    def test_detects_each_released_variant(self):
+        cases = {
+            (35, 1536): "gemma4_e2b",
+            (42, 2560): "gemma4_e4b",
+            (60, 5376): "gemma4_31b",
+            (30, 2816): "gemma4_26b_a4b",
+        }
+        for (num_layers, hidden), expected in cases.items():
+            config = {"text_config": {"num_hidden_layers": num_layers, "hidden_size": hidden}}
+            assert _detect_variant(config) == expected
+
+    def test_accepts_flat_text_config(self):
+        assert _detect_variant({"num_hidden_layers": 35, "hidden_size": 1536}) == "gemma4_e2b"
+
+    def test_unknown_shape_raises(self):
+        with pytest.raises(ValueError, match="known Gemma 4 variant"):
+            _detect_variant({"num_hidden_layers": 7, "hidden_size": 99})
+
+    def test_reads_config_next_to_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / "config.json").write_text(
+                json.dumps({"text_config": {"num_hidden_layers": 35, "hidden_size": 1536}})
+            )
+            assert _detect_variant(_read_hf_config(path)) == "gemma4_e2b"
+            # Also resolvable from a weights file path.
+            assert _read_hf_config(path / "model.safetensors") is not None
+
+    def test_missing_config_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assert _read_hf_config(Path(tmp)) is None
+
+    def test_from_pretrained_without_config_requires_variant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(ValueError, match="pass variant"):
+                from_pretrained(tmp)
+
+    def test_from_pretrained_rejects_unknown_variant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with pytest.raises(ValueError, match="Unknown variant"):
+                from_pretrained(tmp, variant="gemma4_nope")

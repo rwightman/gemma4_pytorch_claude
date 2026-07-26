@@ -1,7 +1,6 @@
 """Unit tests for top-level Gemma4Model and generation."""
 
 import torch
-import pytest
 
 from gemma4_pt_claude.config import (
     AttentionType,
@@ -17,7 +16,6 @@ from gemma4_pt_claude.model import (
     flatten_multimodal_tokens,
     make_causal_mask,
     make_causal_mask_with_cache,
-    make_causal_bidirectional_mask,
 )
 from gemma4_pt_claude.generate import generate, init_cache
 from gemma4_pt_claude.module_utils import InitContext

@@ -75,17 +75,20 @@ class VisionPatchEmbedder(InitModule):
     ) -> torch.Tensor:
         """Compute factorised positional embeddings from 2-D coords.
 
+        Equivalent to the reference one-hot matmul, but a gather instead: the
+        one-hot form materialises ``[B, L, 2, position_embedding_size]``, which
+        is hundreds of MB for a full-resolution image.
+
         Args:
             position_ids: ``[B, L, 2]`` (x, y).
             padding_mask: ``[B, L]`` True where padding.
         """
         clamped = position_ids.clamp(min=0)  # [B, L, 2]
-        one_hot = F.one_hot(
-            clamped, num_classes=self.cfg.position_embedding_size,
-        )  # [B, L, 2, pos_size]
-        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)  # [B, 2, L, pos_size]
-        pos_emb = one_hot @ self.position_embedding_table  # [B, 2, L, d_model]
-        pos_emb = pos_emb.sum(dim=1)  # [B, L, d_model]
+        table = self.position_embedding_table
+        pos_emb = (
+            F.embedding(clamped[..., 0], table[0])
+            + F.embedding(clamped[..., 1], table[1])
+        )  # [B, L, d_model]
         pos_emb = torch.where(padding_mask.unsqueeze(-1), 0.0, pos_emb)
         return pos_emb
 
@@ -181,10 +184,11 @@ class VisionAttention(InitModule):
         self.d_model = cfg.d_model
         dd = factory_kwargs(device, dtype)
 
-        self.q_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim, residual_init_std=self.init_std, **dd)
-        self.k_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim, residual_init_std=self.init_std, **dd)
-        self.v_proj = _make_vision_proj(cfg, cfg.d_model, cfg.num_heads * cfg.head_dim, residual_init_std=self.init_std, **dd)
-        self.o_proj = _make_vision_proj(cfg, cfg.num_heads * cfg.head_dim, cfg.d_model, residual_init_std=self.residual_init_std, **dd)
+        inner_dim = cfg.num_heads * cfg.head_dim
+        self.q_proj = _make_vision_proj(cfg, cfg.d_model, inner_dim, residual_init_std=self.init_std, **dd)
+        self.k_proj = _make_vision_proj(cfg, cfg.d_model, inner_dim, residual_init_std=self.init_std, **dd)
+        self.v_proj = _make_vision_proj(cfg, cfg.d_model, inner_dim, residual_init_std=self.init_std, **dd)
+        self.o_proj = _make_vision_proj(cfg, inner_dim, cfg.d_model, residual_init_std=self.residual_init_std, **dd)
 
         self.q_norm = VisionRMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, **dd)
         self.k_norm = VisionRMSNorm(cfg.head_dim, eps=cfg.rms_norm_eps, **dd)
@@ -208,9 +212,9 @@ class VisionAttention(InitModule):
             if self.o_proj.bias is not None:
                 nn.init.zeros_(self.o_proj.bias)
         if self.q_norm.weight is not None:
-            nn.init.zeros_(self.q_norm.weight)
+            nn.init.ones_(self.q_norm.weight)
         if self.k_norm.weight is not None:
-            nn.init.zeros_(self.k_norm.weight)
+            nn.init.ones_(self.k_norm.weight)
         if self.v_norm.weight is not None:
             nn.init.ones_(self.v_norm.weight)
 
@@ -255,11 +259,14 @@ class VisionAttention(InitModule):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        attn_weights = torch.matmul(q, k.transpose(-2, -1))
-        attn_weights = attn_weights + attention_mask
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(v.dtype)
-
-        out = torch.matmul(attn_weights, v)  # [B, N, L, H]
+        # QK-norm replaces 1/sqrt(d) scaling, so scale = 1.0.  The mask is
+        # additive with a large finite negative (not -inf), so fully-masked
+        # padding rows stay finite here exactly as in the reference.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attention_mask.to(q.dtype),
+            scale=1.0,
+        )  # [B, N, L, H]
         out = out.transpose(1, 2).reshape(B, L, N * H)
         return self.o_proj(out)
 
@@ -312,14 +319,16 @@ class VisionBlock(InitModule):
         return x
 
     def _init_weights(self, ctx) -> None:
+        # One-initialized: Gemma 4 norms are multiplicative, so a zero scale
+        # would make this block an exact identity with zero gradients.
         if self.pre_attn_norm.weight is not None:
-            nn.init.zeros_(self.pre_attn_norm.weight)
+            nn.init.ones_(self.pre_attn_norm.weight)
         if self.post_attn_norm.weight is not None:
-            nn.init.zeros_(self.post_attn_norm.weight)
+            nn.init.ones_(self.post_attn_norm.weight)
         if self.pre_ffw_norm.weight is not None:
-            nn.init.zeros_(self.pre_ffw_norm.weight)
+            nn.init.ones_(self.pre_ffw_norm.weight)
         if self.post_ffw_norm.weight is not None:
-            nn.init.zeros_(self.post_ffw_norm.weight)
+            nn.init.ones_(self.post_ffw_norm.weight)
 
 
 # ---------------------------------------------------------------------------

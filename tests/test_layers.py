@@ -1,7 +1,6 @@
 """Unit tests for core layer primitives."""
 
 import torch
-import pytest
 
 from gemma4_pt_claude.layers import (
     GatedMLP,
@@ -39,9 +38,11 @@ class TestRMSNorm:
         norm = RMSNorm(16, zero_init=True)
         assert (norm.weight == 0).all()
 
-    def test_vision_rms_norm_zero_init(self):
+    def test_vision_rms_norm_ones_init(self):
+        # Gemma 4 norms are multiplicative, so the vision scale is one-initialized.
+        # A zero scale would make every vision block an exact identity.
         norm = VisionRMSNorm(16)
-        assert (norm.weight == 0).all()
+        assert (norm.weight == 1).all()
 
     def test_dtype_preservation(self):
         norm = RMSNorm(32).to(torch.bfloat16)

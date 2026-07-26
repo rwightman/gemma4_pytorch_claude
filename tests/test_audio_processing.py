@@ -1,7 +1,6 @@
 """Tests for audio_processing.py — mel spectrogram extraction and preprocessing."""
 
 import math
-import sys
 
 import numpy as np
 import pytest
@@ -91,31 +90,45 @@ class TestToFloat32:
 
 
 # ---------------------------------------------------------------------------
-# Import guard (no torchaudio needed)
+# Import guard — torchaudio is only needed for resampling
 # ---------------------------------------------------------------------------
 
 class TestImportGuard:
-    def test_error_without_torchaudio(self):
-        """Calling extract_mel_spectrogram without torchaudio raises ImportError."""
+    @staticmethod
+    def _without_torchaudio():
         import gemma4_pt_claude.audio_processing as ap
-        original = ap._HAS_TORCHAUDIO
-        try:
-            ap._HAS_TORCHAUDIO = False
-            with pytest.raises(ImportError, match="torchaudio"):
-                ap.extract_mel_spectrogram(torch.randn(16000))
-        finally:
-            ap._HAS_TORCHAUDIO = original
 
-    def test_preprocess_error_without_torchaudio(self):
-        """Calling preprocess_audio without torchaudio raises ImportError."""
-        import gemma4_pt_claude.audio_processing as ap
-        original = ap._HAS_TORCHAUDIO
-        try:
-            ap._HAS_TORCHAUDIO = False
+        class _Patch:
+            def __enter__(self):
+                self.original = ap._HAS_TORCHAUDIO
+                ap._HAS_TORCHAUDIO = False
+                return ap
+
+            def __exit__(self, *exc):
+                ap._HAS_TORCHAUDIO = self.original
+
+        return _Patch()
+
+    def test_mel_extraction_works_without_torchaudio(self):
+        """Mel extraction is pure PyTorch — it must not require torchaudio."""
+        with self._without_torchaudio() as ap:
+            mel = ap.extract_mel_spectrogram(torch.randn(16000))
+        assert mel.shape[-1] == 128
+
+    def test_preprocess_works_without_torchaudio(self):
+        with self._without_torchaudio() as ap:
+            out = ap.preprocess_audio(torch.randn(16000))
+        assert out["audio_mel"].shape[-1] == 128
+
+    def test_resampling_requires_torchaudio(self):
+        """Only the resample path needs torchaudio, and it says so."""
+        from gemma4_pt_claude.composer import AudioTransform
+        from gemma4_pt_claude.config import AudioConfig
+
+        transform = AudioTransform(AudioConfig())
+        with self._without_torchaudio():
             with pytest.raises(ImportError, match="torchaudio"):
-                ap.preprocess_audio(torch.randn(16000))
-        finally:
-            ap._HAS_TORCHAUDIO = original
+                transform(torch.randn(8000), sample_rate=8000)
 
 
 # ---------------------------------------------------------------------------

@@ -12,12 +12,16 @@ dependencies = [
     "torch>=2.1",
     "sentencepiece",
     "safetensors",
+    # Backend for HuggingFace tokenizer.json, which is the documented path.
+    "tokenizers",
 ]
 
 [project.optional-dependencies]
-audio = ["torchaudio>=2.1"]
+audio = ["torchaudio>=2.1"]        # resampling only; mel extraction is pure torch
+image = ["pillow"]                 # PIL input to the image preprocessor
 convert = ["jax", "orbax-checkpoint", "numpy"]
-dev = ["pytest", "jax", "flax"]
+all = ["gemma4-pt-claude[audio,image]"]
+dev = ["pytest", "pytest-timeout", "pillow", "torchaudio>=2.1", "ruff"]
 
 [project.scripts]
 gemma4-convert = "gemma4_pt_claude.convert:main"
@@ -27,8 +31,31 @@ source = "file"
 path = "src/gemma4_pt_claude/version.py"
 
 [tool.pdm.build]
-includes = ["src/gemma4_pt_claude"]
+includes = ["src/gemma4_pt_claude", "src/gemma4_pt_claude/py.typed"]
 package-dir = "src"
 
 [tool.pdm.dev-dependencies]
 test = ["pytest", "pytest-timeout"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: tests that take more than a second or two",
+]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Correctness rules only; import ordering and pyupgrade rewrites are left off so
+# linting never demands a codebase-wide reshuffle.
+select = ["E", "F", "W", "B"]
+ignore = [
+    "E741",  # ambiguous names like `l` are conventional for sequence length
+    "B905",  # zip(strict=) reads poorly where lengths are already validated
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/gemma4_pt_claude/__init__.py" = ["F401"]  # re-exports

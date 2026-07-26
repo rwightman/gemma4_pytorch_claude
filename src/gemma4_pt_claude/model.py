@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+from .attention import bidirectional_block_ids, cache_offset
 from .audio_encoder import AudioEncoder
-from .config import Gemma4Config
+from .config import EncoderFreeAudioConfig, EncoderFreeVisionConfig, Gemma4Config
+from .encoder_free import EncoderFreeAudioEmbedder, EncoderFreeVisionEmbedder
 from .layers import RMSNorm
-from .module_utils import InitContext, InitModule, factory_kwargs
+from .module_utils import DEFAULT_INIT_STD, InitContext, InitModule, factory_kwargs
 from .transformer import TextDecoder
 from .vision_encoder import VisionEncoder
 # ---------------------------------------------------------------------------
@@ -61,10 +62,7 @@ def make_causal_bidirectional_mask(
         ``[B, L, S]`` bool with bidirectional attention within contiguous
         True spans of ``bidirectional_mask``.
     """
-    # Number contiguous True regions with unique block IDs
-    padded = F.pad(bidirectional_mask.long(), (1, 0), value=0)
-    boundary = padded[:, 1:] > padded[:, :-1]  # rising edges
-    block_ids = bidirectional_mask.long() * boundary.long().cumsum(dim=-1)  # [B, L]
+    block_ids = bidirectional_block_ids(bidirectional_mask)  # [B, L]
 
     # Allow bidirectional within same block (same nonzero block_id)
     S = causal_mask.shape[2]
@@ -152,7 +150,7 @@ class VisionEmbedder(InitModule):
             self,
             mm_dim: int,
             text_dim: int,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             eps: float = 1e-6,
             *,
             device: torch.device | str | None = None,
@@ -182,7 +180,7 @@ class AudioEmbedder(InitModule):
             self,
             mm_dim: int,
             text_dim: int,
-            init_std: float,
+            init_std: float = DEFAULT_INIT_STD,
             eps: float = 1e-6,
             *,
             device: torch.device | str | None = None,
@@ -229,9 +227,14 @@ class Gemma4Model(InitModule):
         self.cfg = cfg
         self.text_decoder = TextDecoder(cfg.text, **dd)
 
+        # Vision: either a tower + projection, or (encoder-free) a direct
+        # projection of merged raw pixel patches.
         self.vision_encoder = None
         self.embed_vision = None
-        if cfg.vision is not None:
+        self.vision_embedder = None
+        if isinstance(cfg.vision, EncoderFreeVisionConfig):
+            self.vision_embedder = EncoderFreeVisionEmbedder(cfg.vision, **dd)
+        elif cfg.vision is not None:
             self.vision_encoder = VisionEncoder(cfg.vision, **dd)
             self.embed_vision = VisionEmbedder(
                 cfg.vision.d_model, cfg.vision.text_embed_dim,
@@ -240,9 +243,14 @@ class Gemma4Model(InitModule):
                 **dd,
             )
 
+        # Audio: either a conformer + projection, or (encoder-free) a direct
+        # projection of raw waveform frames.
         self.audio_encoder = None
         self.embed_audio = None
-        if cfg.audio is not None:
+        self.audio_embedder = None
+        if isinstance(cfg.audio, EncoderFreeAudioConfig):
+            self.audio_embedder = EncoderFreeAudioEmbedder(cfg.audio, **dd)
+        elif cfg.audio is not None:
             self.audio_encoder = AudioEncoder(cfg.audio, **dd)
             self.embed_audio = AudioEmbedder(
                 cfg.audio.lm_model_dims, cfg.text.embed_dim,
@@ -295,12 +303,18 @@ class Gemma4Model(InitModule):
             audio_mel_mask: torch.Tensor | None = None,
             audio_mask: torch.Tensor | None = None,
             audio_num_soft_tokens: torch.Tensor | None = None,
+            # Encoder-free audio inputs (12B)
+            audio_frames: torch.Tensor | None = None,
+            audio_frame_mask: torch.Tensor | None = None,
+            logits_to_keep: int = 0,
     ) -> tuple[torch.Tensor, dict | None]:
         """
         Args:
             tokens: ``[B, L]`` token ids
             positions: ``[B, L]`` absolute positions (auto-generated if None)
-            attention_mask: ``[B, L, S]`` bool (auto-generated causal if None)
+            attention_mask: ``[B, L, S]`` bool.  When None (the default) each
+                attention layer derives its own causal mask from ``positions``,
+                which stays correct when layers have differently sized caches.
             cache: KV cache dict (optional)
             pixel_values: ``[B, max_patches, patch_dim]`` — patchified images
             image_position_ids: ``[B, max_patches, 2]`` — (x,y) coords (-1 = padding)
@@ -309,6 +323,10 @@ class Gemma4Model(InitModule):
             audio_mel_mask: ``[B, T]`` bool — True for valid mel frames
             audio_mask: ``[B, L]`` bool — True at audio placeholder positions in text
             audio_num_soft_tokens: ``[B_audio]`` int — explicit soft-token counts per clip
+            audio_frames: ``[B, T, samples_per_token]`` — raw waveform frames
+                (encoder-free variants; use instead of ``audio_mel``)
+            audio_frame_mask: ``[B, T]`` bool — True for valid frames
+            logits_to_keep: only decode logits for the last N positions (0 = all)
 
         Returns:
             (logits, new_cache)
@@ -318,29 +336,8 @@ class Gemma4Model(InitModule):
 
         # --- Default positions ---
         if positions is None:
-            if cache is not None:
-                # All batch elements must share the same cache fill level
-                first_cache = next(iter(cache.values()))
-                offset = first_cache["end_index"][0].item()
-                assert (first_cache["end_index"] == offset).all(), (
-                    "Heterogeneous batch end_index not supported"
-                )
-                positions = torch.arange(offset, offset + L, device=device).unsqueeze(0).expand(B, -1)
-            else:
-                positions = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
-
-        # --- Default causal mask ---
-        if attention_mask is None:
-            if cache is not None:
-                first_cache = next(iter(cache.values()))
-                cache_len = first_cache["k"].shape[1]
-                cache_offset = first_cache["end_index"][0].item()
-                # Build causal mask; valid_mask is applied inside attention.py
-                attention_mask = make_causal_mask_with_cache(
-                    L, cache_len, cache_offset, device,
-                ).expand(B, -1, -1)
-            else:
-                attention_mask = make_causal_mask(L, device).expand(B, -1, -1)
+            offset = cache_offset(next(iter(cache.values()))) if cache else 0
+            positions = torch.arange(offset, offset + L, device=device).unsqueeze(0).expand(B, -1)
 
         # --- Embed text tokens ---
         # Sanitize negative placeholder tokens for embedding lookup.
@@ -355,8 +352,16 @@ class Gemma4Model(InitModule):
                 embed_tokens[audio_mask] = 0
         x = self.text_decoder.embedder.encode(embed_tokens)
 
-        # --- Vision: encode + project + merge ---
-        if pixel_values is not None and self.vision_encoder is not None:
+        # --- Vision: encode (or project directly) + merge ---
+        if pixel_values is not None and self.vision_embedder is not None:
+            # Encoder-free: merged raw patches straight into text space.
+            vision_embeddings, pooler_mask = self.vision_embedder(pixel_values, image_position_ids)
+            vision_embeddings = vision_embeddings.to(x.device, x.dtype)
+            if image_mask is not None:
+                x = merge_multimodal_embeddings(
+                    x, vision_embeddings, pooler_mask, image_mask,
+                )
+        elif pixel_values is not None and self.vision_encoder is not None:
             vision_out, pooler_mask = self.vision_encoder(pixel_values, image_position_ids)
             vision_embeddings = self.embed_vision(vision_out)
             vision_embeddings = vision_embeddings.to(x.device, x.dtype)
@@ -397,9 +402,34 @@ class Gemma4Model(InitModule):
                     x, audio_embeddings, audio_valid_mask, audio_mask,
                 )
 
-        # --- Bidirectional vision (31B, 26B-A4B) ---
+        # --- Audio (encoder-free): raw waveform frames projected directly ---
+        if audio_frames is not None and self.audio_embedder is not None:
+            audio_embeddings, audio_valid_mask = self.audio_embedder(audio_frames, audio_frame_mask)
+            audio_embeddings = audio_embeddings.to(x.device, x.dtype)
+            if audio_num_soft_tokens is not None:
+                audio_valid_mask = audio_valid_mask & build_audio_token_mask(
+                    audio_num_soft_tokens.to(audio_valid_mask.device),
+                    audio_embeddings.shape[1],
+                )
+            if audio_mask is not None:
+                if audio_embeddings.shape[0] != B:
+                    if B != 1:
+                        raise ValueError(
+                            "Multimodal audio batch size must match token batch size unless B == 1."
+                        )
+                    audio_embeddings, audio_valid_mask = flatten_multimodal_tokens(
+                        audio_embeddings, audio_valid_mask,
+                    )
+                x = merge_multimodal_embeddings(
+                    x, audio_embeddings, audio_valid_mask, audio_mask,
+                )
+
+        # --- Bidirectional vision (31B, 26B-A4B, 12B) ---
+        # Applied inside attention so it also holds during cached prefill, where
+        # the key axis is a cache-slot layout rather than the token axis.
+        bidirectional_mask = None
         if self.cfg.text.bidirectional_vision and image_mask is not None:
-            attention_mask = make_causal_bidirectional_mask(attention_mask, image_mask)
+            bidirectional_mask = image_mask
 
         # --- Per-layer inputs ---
         # embed_tokens already has 0 at placeholder positions, so PLI lookup
@@ -413,6 +443,8 @@ class Gemma4Model(InitModule):
             x, positions, attention_mask,
             per_layer_inputs=per_layer_inputs,
             cache=cache,
+            bidirectional_mask=bidirectional_mask,
+            logits_to_keep=logits_to_keep,
         )
 
         return logits, new_cache

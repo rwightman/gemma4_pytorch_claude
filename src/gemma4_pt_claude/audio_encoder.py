@@ -155,9 +155,10 @@ class ChunkedLocalAttention(InitModule):
         )
         self.per_dim_scale = nn.Parameter(torch.ones(self.head_dim, **dd))
 
-        self.q_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False, init_std=self.init_std, **dd)
-        self.k_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False, init_std=self.init_std, **dd)
-        self.v_proj = ClippedLinear(cfg.hidden_size, cfg.num_heads * self.head_dim, bias=False, init_std=self.init_std, **dd)
+        inner_dim = cfg.num_heads * self.head_dim
+        self.q_proj = ClippedLinear(cfg.hidden_size, inner_dim, bias=False, init_std=self.init_std, **dd)
+        self.k_proj = ClippedLinear(cfg.hidden_size, inner_dim, bias=False, init_std=self.init_std, **dd)
+        self.v_proj = ClippedLinear(cfg.hidden_size, inner_dim, bias=False, init_std=self.init_std, **dd)
 
         self.q_scale_base = self._build_q_scale_base()
         self.key_scale = self._build_key_scale()
@@ -473,7 +474,9 @@ class LightweightConvBlock(InitModule):
         self.gradient_clip = cfg.gradient_clipping
         dd = factory_kwargs(device, dtype)
         self.pre_norm = RMSNorm(cfg.hidden_size, **dd)
-        self.linear_start = ClippedLinear(cfg.hidden_size, cfg.hidden_size * 2, bias=False, init_std=self.init_std, **dd)
+        self.linear_start = ClippedLinear(
+            cfg.hidden_size, cfg.hidden_size * 2, bias=False, init_std=self.init_std, **dd,
+        )
         self.dwconv = nn.Conv1d(
             cfg.hidden_size, cfg.hidden_size,
             kernel_size=cfg.conv_kernel_size,

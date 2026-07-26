@@ -9,6 +9,8 @@ from __future__ import annotations
 from .config import (
     AttentionType,
     AudioConfig,
+    EncoderFreeAudioConfig,
+    EncoderFreeVisionConfig,
     Gemma4Config,
     KVCacheSharingConfig,
     MoEConfig,
@@ -229,6 +231,61 @@ def gemma4_31b(
     cfg = Gemma4Config(
         text=text,
         vision=None if text_only else _large_vision(embed_dim),
+    )
+    return Gemma4Model(cfg, device=device, dtype=dtype, init_context=init_context)
+
+
+# ---------------------------------------------------------------------------
+# Gemma4 12B (encoder-free multimodal)
+# ---------------------------------------------------------------------------
+
+def gemma4_12b(
+        text_only: bool = False,
+        *,
+        device: str | None = None,
+        dtype=None,
+        init_context: InitContext | None = None,
+) -> Gemma4Model:
+    """Gemma4 12B: 48 layers, embed=3840, 16H/8KV(1 global KV), 5:1, sw=1024.
+
+    Encoder-free multimodal (HF ``gemma4_unified``): no vision tower and no
+    conformer.  Images are projected from merged 48px raw pixel patches and audio
+    from raw 640-sample waveform frames.
+    """
+    num_layers = 48
+    embed_dim = 3840
+    text = TextConfig(
+        vocab_size=262_144,
+        embed_dim=embed_dim,
+        hidden_dim=embed_dim * _FFW_HIDDEN_RATIO,
+        num_heads=16,
+        head_dim=256,
+        num_kv_heads=8,
+        num_layers=num_layers,
+        sliding_window_size=1024,
+        final_logit_softcap=30.0,
+        attention_pattern=_GEMMA4_PATTERN_5_1,
+        use_qk_norm=True,
+        use_value_norm=True,
+        use_post_attn_norm=True,
+        use_post_ffw_norm=True,
+        local_rope_base=10_000,
+        global_rope_base=1_000_000,
+        rope_proportion=1.0,
+        global_rope_proportion=0.25,
+        k_eq_v_global=True,
+        bidirectional_vision=True,
+        num_global_kv_heads=1,
+        global_head_dim=_DEFAULT_GLOBAL_KEY_SIZE,
+    )
+    cfg = Gemma4Config(
+        text=text,
+        vision=None if text_only else EncoderFreeVisionConfig(
+            mm_embed_dim=embed_dim,
+            output_proj_dims=embed_dim,
+            text_embed_dim=embed_dim,
+        ),
+        audio=None if text_only else EncoderFreeAudioConfig(text_embed_dim=embed_dim),
     )
     return Gemma4Model(cfg, device=device, dtype=dtype, init_context=init_context)
 

@@ -9,9 +9,29 @@ Text, vision, and audio. No mystery abstractions. Just PyTorch and matrix multip
 | Variant | Layers | Embed | Heads | KV Heads | Attention | Notable Features |
 |---------|--------|-------|-------|----------|-----------|-----------------|
 | **E2B** | 35 | 1536 | 8 | 1 | 4:1 local:global | PLI, KV sharing, vision, audio |
-| **E4B** | 42 | 2560 | 8 | 2 | 5:1 local:global | PLI, KV sharing, V-norm, vision, audio |
+| **E4B** | 42 | 2560 | 8 | 2 | 5:1 local:global | PLI, KV sharing, vision, audio |
+| **12B** | 48 | 3840 | 16 | 8 (1 global) | 5:1 local:global | Encoder-free vision + audio, K=V global |
 | **31B** | 60 | 5376 | 32 | 16 (4 global) | 5:1 local:global | K=V global, bidirectional vision |
-| **26B-A4B** | 30 | 2816 | 16 | 8 (2 global) | 5:1 local:global | MoE (128 experts, top-8) |
+| **26B-A4B** | 30 | 2816 | 16 | 8 (2 global) | 5:1 local:global | MoE (128 experts, top-8), K=V global, vision |
+
+All five use QK-norm and V-norm.
+
+### Encoder-free variants (12B)
+
+The 12B (HF `gemma4_unified`) drops the multimodal towers entirely — there is no
+SigLIP-style vision encoder and no conformer:
+
+- **Vision**: raw **48×48** pixel patches (3×3 groups of 16px patches merged) →
+  LayerNorm → Linear → LayerNorm → factorised 2-D position embedding → LayerNorm
+  → RMSNorm → Linear. The spatial pooling the tower models apply *after* their
+  encoder happens here instead, before any projection.
+- **Audio**: raw 16 kHz waveform chunked into **640-sample** frames (40 ms), each
+  frame projected by RMSNorm → Linear. No mel spectrogram.
+
+The text decoder is the same `TransformerBlock` as every other variant. Config
+types are `EncoderFreeVisionConfig` / `EncoderFreeAudioConfig`; `Composer` and
+`preprocess_images` handle both families automatically, and the encoder-free
+audio path passes `audio_frames` where the tower path passes `audio_mel`.
 
 ## Installation
 
@@ -19,49 +39,51 @@ Text, vision, and audio. No mystery abstractions. Just PyTorch and matrix multip
 pip install -e .
 ```
 
-Core dependencies are `torch`, `sentencepiece`, and `safetensors`.
+Core dependencies are `torch`, `sentencepiece`, `safetensors`, and `tokenizers`.
 
 Optional extras:
 
 ```bash
-pip install -e ".[audio]"    # adds torchaudio (for audio resampling)
+pip install -e ".[image]"    # adds pillow (PIL image input)
+pip install -e ".[audio]"    # adds torchaudio (resampling non-16 kHz audio)
+pip install -e ".[all]"      # image + audio
 pip install -e ".[convert]"  # adds jax + orbax (for JAX checkpoint conversion)
 ```
 
+Mel-spectrogram extraction is pure PyTorch; `torchaudio` is only needed to
+resample audio that is not already at 16 kHz.
+
 ## Quickstart
 
-### Fresh model vs checkpoint load
+### Loading a checkpoint
 
-Top-level factory functions behave differently depending on whether you construct
-them normally or under a meta-device context:
-
-- normal construction: creates a fully initialized model
-- `with torch.device("meta")`: creates an unmaterialized model, intended for checkpoint loading
-
-If you want a fresh random-init model:
-
-```python
-import gemma4_pt_claude as gemma4
-
-model = gemma4.gemma4_e2b(text_only=True)
-model.eval()
-```
-
-If you want to load a real checkpoint, the recommended path for large HuggingFace
-checkpoints is meta construction plus streaming load:
+`from_pretrained` reads `config.json` next to the weights, picks the matching
+variant, builds the model on the meta device, and streams the checkpoint into it:
 
 ```python
 import torch
 import gemma4_pt_claude as gemma4
 
-weights_dir = "/path/to/hf-model-dir"
+model = gemma4.from_pretrained(
+    "/path/to/hf-model-dir",
+    dtype=torch.bfloat16,
+    device="cuda",
+)
+```
 
+It defaults to `strict=True`, so a variant mismatch fails loudly instead of
+leaving randomly initialized weights in place. Pass `text_only=True` to skip the
+vision/audio towers, or `variant="gemma4_e2b"` when there is no `config.json`.
+
+To pick the variant yourself, construct on meta and stream:
+
+```python
 with torch.device("meta"):
     model = gemma4.gemma4_e2b(text_only=False)
 
 gemma4.load_weights_streaming(
     model,
-    weights_dir,
+    "/path/to/hf-model-dir",
     format="hf",
     dtype=torch.bfloat16,
     device="cuda",
@@ -69,7 +91,24 @@ gemma4.load_weights_streaming(
 model.eval()
 ```
 
-Use `text_only=True` to skip vision/audio encoders when you only need text.
+`load_weights` / `load_weights_streaming` default to `strict=False` and warn when
+parameters are missing from the checkpoint — those keep their initial values, so
+a warning here means the model does not match the weights.
+
+### Fresh random-init model
+
+Top-level factory functions behave differently depending on whether you construct
+them normally or under a meta-device context:
+
+- normal construction: creates a fully initialized model
+- `with torch.device("meta")`: creates an unmaterialized model, intended for checkpoint loading
+
+```python
+import gemma4_pt_claude as gemma4
+
+model = gemma4.gemma4_e2b(text_only=True)
+model.eval()
+```
 
 ### Text generation
 
@@ -81,17 +120,7 @@ import gemma4_pt_claude as gemma4
 
 weights_dir = "/path/to/hf-model-dir"
 tokenizer = gemma4.Gemma4Tokenizer(weights_dir)
-
-with torch.device("meta"):
-    model = gemma4.gemma4_e2b(text_only=True)
-gemma4.load_weights_streaming(
-    model,
-    weights_dir,
-    format="hf",
-    dtype=torch.bfloat16,
-    device="cuda",
-)
-model.eval()
+model = gemma4.from_pretrained(weights_dir, dtype=torch.bfloat16, device="cuda", text_only=True)
 
 response = gemma4.chat(
     model,
@@ -101,6 +130,28 @@ response = gemma4.chat(
     temperature=0.0,
 )
 print(response)
+```
+
+### Streaming output
+
+Pass a `callback` to see tokens as they are produced; return True to stop early:
+
+```python
+def on_token(step):  # step is a [B] tensor of newly sampled token ids
+    print(tokenizer.decode([int(step[0])]), end="", flush=True)
+
+gemma4.chat(model, tokenizer, "Write a haiku about KV caches.", callback=on_token)
+```
+
+### Batched generation
+
+`generate()` accepts a batch of equal-length prompts. Each sequence stops
+independently at its first stop token and is padded with `pad_token_id`
+afterwards:
+
+```python
+tokens = torch.stack([prompt_a, prompt_b])   # [2, L], same length
+out = gemma4.generate(model, tokens, max_new_tokens=64, temperature=0.0)
 ```
 
 For lower-level control, build the chat prompt yourself and call `generate()`:
@@ -181,6 +232,11 @@ The Composer automatically:
 - Resizes and patchifies the image for the vision encoder
 - Inserts `<|image|>` markers with the correct number of soft-token placeholders
 - Builds the image mask for the model's multimodal embedding merge
+
+Image blocks are emitted as `<start_of_image>` + soft tokens + `<end_of_image>`
+with no surrounding newlines, matching the Gemma 4 reference processor. (Gemma 3
+and 3n wrapped image blocks in `\n\n`; pass `Composer(..., image_newline_wrap=True)`
+to reproduce that.)
 
 ### Audio transcription
 
@@ -283,6 +339,34 @@ Practical note:
 - `temperature=0.0` is greedy and is the safest setting for comparisons/regression tests
 - very high temperatures with `top_k=0` and `top_p=1.0` will produce degenerate sampling quickly
 
+## KV Cache
+
+`generate()` sizes the cache to `prompt + max_new_tokens` and raises if a write
+would overflow it, rather than silently evicting tokens the model still needs.
+
+Sliding-window layers only ever attend within their window, so they are allocated
+`max(sliding_window_size, prompt_len)` slots and roll over. This is where most of
+the KV memory goes at long context:
+
+| Model | Cache @ 32k context | With window-sized local layers |
+|-------|--------------------|-------------------------------|
+| 31B | 29.5 GB | 3.5 GB |
+| 26B-A4B | 7.4 GB | 0.9 GB |
+
+Building a cache yourself:
+
+```python
+cache = gemma4.init_cache(
+    model.cfg, batch_size=1, cache_length=32768,
+    dtype=torch.bfloat16, device="cuda",
+    prefill_len=len(prompt_ids),   # omit for full-length caches on every layer
+)
+```
+
+Global layers always keep the full context. The saving depends on the prompt
+being short relative to the total context, since a single-shot prefill has to
+hold all of its own keys at once.
+
 ## Weight Loading
 
 Supports HuggingFace safetensors directories and native safetensors files.
@@ -376,6 +460,8 @@ Key architectural features:
 - **KV sharing** — Later layers reuse KV from earlier layers, no redundant cache allocation (E2B, E4B)
 - **K=V** — Key and value projections share weights for global layers (31B, 26B-A4B)
 - **MoE** — 128 experts with top-8 routing + parallel dense branch (26B-A4B)
+- **Encoder-free multimodal** — no vision/audio towers; raw patches and waveform
+  frames projected straight into text space (12B)
 - **Skip scale** — Learned scalar multiplied at the end of each block
 - **Vision encoder** — ViT-style with factorised 2-D positional embeddings and bidirectional attention
 - **Audio encoder** — Conformer stack with mel spectrogram frontend and relative position embeddings
@@ -398,17 +484,27 @@ src/gemma4_pt_claude/
 ├── composer.py          # Multimodal Composer (tokenize + transform + inject)
 ├── tokenizer.py         # SentencePiece + HuggingFace tokenizer backends
 ├── load.py              # Weight loading (HF safetensors + native)
-├── factory.py           # gemma4_e2b(), gemma4_e4b(), gemma4_31b(), gemma4_26b_a4b()
+├── encoder_free.py      # Encoder-free vision/audio embedders (12B)
+├── factory.py           # gemma4_e2b/e4b/12b/31b/26b_a4b()
 └── convert.py           # JAX Orbax → safetensors checkpoint conversion
 ```
 
 ## Tests
 
 ```bash
-pytest tests/                    # full suite (~160 tests)
-pytest tests/ -k "vision"       # filter by keyword
-pytest tests/test_model.py -v   # single file, verbose
+pytest tests/                     # full suite (~265 tests)
+pytest tests/ -k "vision"         # filter by keyword
+pytest tests/test_generate.py -v  # single file, verbose
 ```
+
+`tests/test_generate.py` holds the equivalence properties worth protecting:
+
+- a cached decode reproduces the uncached forward pass (including past the
+  sliding window, with KV sharing, and with rolling caches)
+- the `sdpa` and `eager` backends agree
+- batched rows match generating each prompt on its own
+- cache overflow raises
+- bidirectional image spans survive the cached prefill path
 
 ## Numerical Verification
 
@@ -429,6 +525,17 @@ Every module was verified against the JAX reference implementation with tight to
 
 End-to-end generation verified on E2B with both HuggingFace and Orbax weights (text, image captioning, and audio transcription all produce correct output).
 
+## Attention Backend Notes
+
+- Text attention uses SDPA by default and falls back to the eager einsum path
+  when `attn_logits_soft_cap` is set. The two agree to ~6e-08.
+- The vision tower uses SDPA with `scale=1.0` (QK-norm replaces `1/sqrt(d)`) and
+  a large-finite-negative additive mask, so fully-masked padding rows stay finite.
+- Gemma 4 norms are multiplicative (`x_normed * weight`, one-initialized),
+  unlike Gemma 3's `x_normed * (1 + weight)` around a zero-initialized scale.
+  This matters for fresh initialization: a zero scale would make every block an
+  exact identity with permanently zero gradients.
+
 ## License
 
-Apache 2.0
+Apache 2.0 — see [LICENSE](LICENSE).

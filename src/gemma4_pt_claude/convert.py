@@ -90,11 +90,11 @@ def _load_orbax_checkpoint(checkpoint_path: str) -> dict:
     """Load an Orbax checkpoint and return flat param dict."""
     try:
         import orbax.checkpoint as ocp
-    except ImportError:
+    except ImportError as err:
         raise ImportError(
             "orbax-checkpoint is required for conversion. "
             "Install with: pip install 'gemma4-pt-claude[convert]'"
-        )
+        ) from err
 
     # Support both local paths and GCS URIs (gs://...)
     ckpt_path: str | Path = checkpoint_path
@@ -425,12 +425,18 @@ def _convert_audio_orbax(
         # FFN blocks (fflayer_start → ffw_start, fflayer_end → ffw_end)
         for jax_ffw, pt_ffw in [("fflayer_start", "ffw_start"), ("fflayer_end", "ffw_end")]:
             # up/down projections (ClippedLinear → .linear.weight)
-            for jax_proj, pt_proj in [("ffn_layer1/kernel", "up.linear.weight"), ("ffn_layer2/kernel", "down.linear.weight")]:
+            for jax_proj, pt_proj in [
+                ("ffn_layer1/kernel", "up.linear.weight"),
+                ("ffn_layer2/kernel", "down.linear.weight"),
+            ]:
                 k = f"{jax_pfx}/{jax_ffw}/{jax_proj}"
                 if k in jax_params:
                     state_dict[f"{pt_pfx}.{pt_ffw}.{pt_proj}"] = _convert_linear(jax_params[k])
             # Norms
-            for jax_n, pt_n in [("pre_layer_norm/scale", "pre_norm.weight"), ("post_layer_norm/scale", "post_norm.weight")]:
+            for jax_n, pt_n in [
+                ("pre_layer_norm/scale", "pre_norm.weight"),
+                ("post_layer_norm/scale", "post_norm.weight"),
+            ]:
                 k = f"{jax_pfx}/{jax_ffw}/{jax_n}"
                 if k in jax_params:
                     state_dict[f"{pt_pfx}.{pt_ffw}.{pt_n}"] = _convert_scale(jax_params[k])

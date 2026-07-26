@@ -7,7 +7,8 @@ Matches the JAX ``GemaxMelFilterbank`` exactly:
 - Semi-causal padding: ``pad(waveform, (160, 159))`` then STFT with ``center=False``
 - ``log(mel + 0.001)``
 
-Requires ``torchaudio`` (install via ``pip install gemma4-pt-claude[audio]``).
+Mel extraction itself is pure PyTorch.  ``torchaudio`` is only needed to
+resample inputs that are not already at 16 kHz (``pip install gemma4-pt-claude[audio]``).
 """
 
 from __future__ import annotations
@@ -15,11 +16,10 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    pass
+    import numpy as np
 
 try:
     import torchaudio  # noqa: F401
@@ -31,7 +31,7 @@ except ImportError:
 def _require_torchaudio() -> None:
     if not _HAS_TORCHAUDIO:
         raise ImportError(
-            "torchaudio is required for audio processing but not installed. "
+            "torchaudio is required for resampling but not installed. "
             "Install it with: pip install gemma4-pt-claude[audio]"
         )
 
@@ -146,8 +146,6 @@ def extract_mel_spectrogram(
     Returns:
         ``[B, frames, 128]`` log-mel spectrogram.
     """
-    _require_torchaudio()
-
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
 
@@ -203,6 +201,37 @@ def extract_mel_spectrogram(
 
 
 # ---------------------------------------------------------------------------
+# Raw waveform framing (encoder-free variants)
+# ---------------------------------------------------------------------------
+
+def frame_waveform(
+        waveform: torch.Tensor,
+        samples_per_token: int = 640,
+) -> torch.Tensor:
+    """Chunk a raw waveform into fixed-length frames, one per audio soft token.
+
+    Encoder-free variants (12B) have no mel frontend and no conformer: each frame
+    of ``samples_per_token`` raw samples becomes a single soft token.  At 16 kHz
+    the default 640 samples is 40 ms.
+
+    Args:
+        waveform: ``[samples]`` mono float waveform at 16 kHz.
+        samples_per_token: samples per frame.
+
+    Returns:
+        ``[num_frames, samples_per_token]`` — zero-padded to a whole frame.
+    """
+    waveform = to_float32(waveform)
+    if waveform.dim() != 1:
+        raise ValueError(f"Expected a 1-D mono waveform, got shape {tuple(waveform.shape)}")
+
+    pad = (-waveform.shape[0]) % samples_per_token
+    if pad:
+        waveform = torch.nn.functional.pad(waveform, (0, pad))
+    return waveform.reshape(-1, samples_per_token)
+
+
+# ---------------------------------------------------------------------------
 # High-level preprocessing
 # ---------------------------------------------------------------------------
 
@@ -225,10 +254,8 @@ def preprocess_audio(
         - ``"audio_mel"``: ``[B, T, 128]`` log-mel spectrogram
         - ``"audio_mel_mask"``: ``[B, T]`` bool — True for valid frames
     """
-    _require_torchaudio()
-
-    if isinstance(waveform, np.ndarray):
-        waveform = torch.from_numpy(waveform)
+    if not isinstance(waveform, torch.Tensor):
+        waveform = torch.as_tensor(waveform)
 
     waveform = to_float32(waveform)
 

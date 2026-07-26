@@ -48,25 +48,26 @@ def build_kv_sharing_patterns(
         return list(range(num_layers))
 
     num_unshared = int(num_layers - kv_sharing.frac_shared_layers * num_layers)
+
+    def last_unshared_of(attn_type: AttentionType) -> int | None:
+        """Index of the last non-sharing layer with *attn_type*, if any."""
+        for j in range(num_unshared - 1, -1, -1):
+            if attention_types[j] == attn_type:
+                return j
+        return None
+
+    share_source = {
+        AttentionType.GLOBAL: last_unshared_of(AttentionType.GLOBAL) if kv_sharing.share_global else None,
+        AttentionType.LOCAL_SLIDING: (
+            last_unshared_of(AttentionType.LOCAL_SLIDING) if kv_sharing.share_local else None
+        ),
+    }
+
     patterns: list[int] = []
     for i in range(num_layers):
-        if i < num_unshared:
-            patterns.append(i)
-        else:
-            if (
-                attention_types[i] == AttentionType.GLOBAL
-                and kv_sharing.share_global
-            ):
-                # Share with last unshared global layer
-                patterns.append(num_unshared - 1)
-            elif (
-                attention_types[i] == AttentionType.LOCAL_SLIDING
-                and kv_sharing.share_local
-            ):
-                # Share with last unshared local layer
-                patterns.append(num_unshared - 2)
-            else:
-                patterns.append(i)
+        source = None if i < num_unshared else share_source[attention_types[i]]
+        # A layer with no eligible source computes its own KV.
+        patterns.append(i if source is None else source)
     return patterns
 
 
@@ -113,6 +114,62 @@ class VisionConfig:
     @property
     def max_patches(self) -> int:
         return self.output_length * self.pooling_kernel_size ** 2
+
+
+@dataclass(frozen=True)
+class EncoderFreeVisionConfig:
+    """Vision config for encoder-free variants (12B, HF ``gemma4_unified``).
+
+    These models have no vision tower at all.  Images are resized and patchified
+    at ``patch_size`` exactly as for the tower models, then ``pooling_kernel_size``
+    square groups of patches are merged into single ``model_patch_size`` patches
+    which are projected straight into text space.  The pooling that the tower
+    models apply *after* their encoder therefore happens here, before any
+    projection.
+    """
+
+    patch_size: int = 16                # teacher patch size used for resizing
+    pooling_kernel_size: int = 3        # k x k teacher patches merged per model patch
+    output_length: int = 280            # soft tokens per image (max)
+    mm_embed_dim: int = 3840            # width of the patch projection
+    output_proj_dims: int = 3840        # input width of the final text projection
+    position_embedding_size: int = 1120  # max per-axis positions
+    rms_norm_eps: float = 1e-6
+    init_std: float = 1e-2
+    position_init_std: float = 2e-2
+    text_embed_dim: int = 3840          # projection target
+
+    @property
+    def model_patch_size(self) -> int:
+        """Side length of a merged patch (48 = 3 * 16)."""
+        return self.patch_size * self.pooling_kernel_size
+
+    @property
+    def patch_dim(self) -> int:
+        """Flattened size of one merged patch (48*48*3 = 6912)."""
+        return self.model_patch_size ** 2 * 3
+
+    @property
+    def max_patches(self) -> int:
+        """Teacher patches before merging."""
+        return self.output_length * self.pooling_kernel_size ** 2
+
+
+@dataclass(frozen=True)
+class EncoderFreeAudioConfig:
+    """Audio config for encoder-free variants (12B, HF ``gemma4_unified``).
+
+    No mel spectrogram and no conformer: the raw 16 kHz waveform is chunked into
+    fixed frames of ``audio_samples_per_token`` samples, and each frame becomes
+    one soft token via a norm + linear projection.
+    """
+
+    audio_samples_per_token: int = 640   # 640 samples @ 16 kHz = 40 ms
+    output_proj_dims: int = 640
+    sample_rate: int = 16_000
+    rms_norm_eps: float = 1e-6
+    init_std: float = 1e-2
+    text_embed_dim: int = 3840
 
 
 @dataclass(frozen=True)
@@ -208,6 +265,19 @@ class TextConfig:
 
 @dataclass(frozen=True)
 class Gemma4Config:
+    """Top-level config.
+
+    ``vision``/``audio`` accept either the tower configs (E2B/E4B/31B/26B-A4B) or
+    the encoder-free configs (12B); the model builds the matching modules.
+    """
+
     text: TextConfig = field(default_factory=TextConfig)
-    vision: VisionConfig | None = None
-    audio: AudioConfig | None = None
+    vision: VisionConfig | EncoderFreeVisionConfig | None = None
+    audio: AudioConfig | EncoderFreeAudioConfig | None = None
+
+    @property
+    def is_encoder_free(self) -> bool:
+        """True when the multimodal towers are replaced by direct projections."""
+        return isinstance(self.vision, EncoderFreeVisionConfig) or isinstance(
+            self.audio, EncoderFreeAudioConfig
+        )

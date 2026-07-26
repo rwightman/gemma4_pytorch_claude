@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 
 from .attention import Attention
 from .config import AttentionType, Gemma4Config, build_kv_sharing_patterns, make_attention_pattern
 from .model import Gemma4Model
+
+# Gemma 4 defaults — EOS and <end_of_turn>.
+DEFAULT_STOP_TOKENS = frozenset({1, 106})
+DEFAULT_PAD_TOKEN_ID = 0
 
 
 def _sample_token(
@@ -43,11 +49,26 @@ def init_cache(
         cache_length: int,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | str = "cpu",
+        prefill_len: int | None = None,
 ) -> dict:
     """Initialise KV cache for all layers.
 
     Shared (borrower) layers are skipped — they reuse the source layer's
     cache directly, saving memory and keeping each cache entry self-consistent.
+
+    Args:
+        cfg: model config.
+        batch_size: batch size.
+        cache_length: slots per layer, i.e. the longest total sequence.
+        dtype: cache dtype.
+        device: cache device.
+        prefill_len: length of the prompt that will be prefilled in one shot.
+            When given, sliding-window layers are allocated only
+            ``max(sliding_window_size, prefill_len)`` slots and become rolling
+            caches — they can never attend outside their window, so older slots
+            are safe to evict.  This is where most of the KV memory goes at long
+            context (31B at 32k: 29.5 GB → 3.5 GB with a short prompt).  Leave
+            as None for a plain full-length cache on every layer.
     """
     text = cfg.text
     attn_types = make_attention_pattern(text.attention_pattern, text.num_layers)
@@ -59,13 +80,24 @@ def init_cache(
         is_global = attn_types[i] == AttentionType.GLOBAL
         layer_head_dim = (text.global_head_dim or text.head_dim) if is_global else text.head_dim
         layer_kv_heads = (text.num_global_kv_heads or text.num_kv_heads) if is_global else text.num_kv_heads
+
+        # A sliding-window layer only ever needs its window, plus room to hold a
+        # whole single-shot prefill (all L keys are written before any are read).
+        layer_length = cache_length
+        rolling = False
+        if prefill_len is not None and not is_global and text.sliding_window_size:
+            window_length = min(cache_length, max(text.sliding_window_size, prefill_len))
+            rolling = window_length < cache_length
+            layer_length = window_length
+
         cache[f"layer_{i}"] = Attention.init_cache(
-            cache_length=cache_length,
+            cache_length=layer_length,
             num_kv_heads=layer_kv_heads,
             head_dim=layer_head_dim,
             batch_size=batch_size,
             dtype=dtype,
             device=device,
+            rolling=rolling,
         )
     return cache
 
@@ -80,6 +112,9 @@ def generate(
         top_p: float = 1.0,
         cache_length: int | None = None,
         stop_tokens: set[int] | None = None,
+        pad_token_id: int = DEFAULT_PAD_TOKEN_ID,
+        callback: Callable[[torch.Tensor], bool | None] | None = None,
+        rolling_cache: bool = True,
         # Optional multimodal inputs (only for prefill)
         pixel_values: torch.Tensor | None = None,
         image_position_ids: torch.Tensor | None = None,
@@ -88,24 +123,38 @@ def generate(
         audio_mel_mask: torch.Tensor | None = None,
         audio_mask: torch.Tensor | None = None,
         audio_num_soft_tokens: torch.Tensor | None = None,
+        audio_frames: torch.Tensor | None = None,
+        audio_frame_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Autoregressive generation with KV cache.
 
+    Batched prompts are supported as long as they are the same length: each
+    sequence stops independently at its first stop token and is padded with
+    ``pad_token_id`` from then on.
+
     Args:
         model: A ``Gemma4Model`` instance.
-        tokens: ``[B, L]`` — prompt token ids.
+        tokens: ``[B, L]`` — prompt token ids (uniform length).
         max_new_tokens: number of tokens to generate.
         temperature: sampling temperature (0 = greedy).
         top_k: top-k filtering (0 = disabled).
         top_p: nucleus sampling threshold (1.0 = disabled).
         cache_length: KV cache length (defaults to prompt + max_new_tokens).
-        stop_tokens: set of token IDs that trigger early stopping.
+        stop_tokens: token IDs that end a sequence (defaults to EOS and
+            ``<end_of_turn>``).
+        pad_token_id: filler emitted for sequences that already stopped.
+        callback: called with each ``[B]`` step of freshly sampled tokens;
+            return True to stop early.  Use this to stream output.
+        rolling_cache: give sliding-window layers window-sized rolling caches
+            instead of full-length ones.  Mathematically equivalent (verified
+            token-identical in float32), but it changes the reduction order, so
+            bfloat16 results can differ on near-ties.  Set False for bit-exact
+            reproducibility against full-length-cache runs.
 
     Returns:
         ``[B, L + generated]`` — prompt + generated tokens.
     """
-    if stop_tokens is None:
-        stop_tokens = {1, 106}  # EOS, END_OF_TURN
+    stop_ids = sorted(DEFAULT_STOP_TOKENS if stop_tokens is None else stop_tokens)
 
     B, L = tokens.shape
     device = tokens.device
@@ -113,15 +162,31 @@ def generate(
 
     if cache_length is None:
         cache_length = L + max_new_tokens
+    elif cache_length < L + max_new_tokens:
+        raise ValueError(
+            f"cache_length={cache_length} is too small for a {L}-token prompt plus "
+            f"{max_new_tokens} new tokens; need at least {L + max_new_tokens}."
+        )
 
     # --- Initialise cache ---
     cache_dtype = next(model.parameters()).dtype
-    cache = init_cache(cfg, B, cache_length, dtype=cache_dtype, device=device)
+    cache = init_cache(
+        cfg, B, cache_length, dtype=cache_dtype, device=device,
+        prefill_len=L if rolling_cache else None,
+    )
+
+    stop_lut = torch.tensor(stop_ids, device=device, dtype=tokens.dtype)
+
+    def is_stop(t: torch.Tensor) -> torch.Tensor:
+        if stop_lut.numel() == 0:
+            return torch.zeros_like(t, dtype=torch.bool)
+        return (t[:, None] == stop_lut[None, :]).any(dim=-1)
 
     # --- Prefill phase ---
     logits, cache = model(
         tokens,
         cache=cache,
+        logits_to_keep=1,
         pixel_values=pixel_values,
         image_position_ids=image_position_ids,
         image_mask=image_mask,
@@ -129,25 +194,27 @@ def generate(
         audio_mel_mask=audio_mel_mask,
         audio_mask=audio_mask,
         audio_num_soft_tokens=audio_num_soft_tokens,
+        audio_frames=audio_frames,
+        audio_frame_mask=audio_frame_mask,
     )
 
-    # Take logits of last position
-    next_logits = logits[:, -1, :]
-    next_token = _sample_token(next_logits, temperature, top_k, top_p)
+    next_token = _sample_token(logits[:, -1, :], temperature, top_k, top_p)
     generated = [next_token]
-
-    if next_token.item() in stop_tokens:
-        return torch.cat([tokens, torch.stack(generated, dim=1)], dim=1)
+    finished = is_stop(next_token)
+    stop_requested = bool(callback(next_token)) if callback is not None else False
 
     # --- Decode loop ---
     for _ in range(max_new_tokens - 1):
-        inp = next_token.unsqueeze(1)  # [B, 1]
-        logits, cache = model(inp, cache=cache)
-        next_logits = logits[:, -1, :]
-        next_token = _sample_token(next_logits, temperature, top_k, top_p)
-        generated.append(next_token)
-        if next_token.item() in stop_tokens:
+        if stop_requested or bool(finished.all()):
             break
+        logits, cache = model(next_token.unsqueeze(1), cache=cache, logits_to_keep=1)
+        next_token = _sample_token(logits[:, -1, :], temperature, top_k, top_p)
+        # Sequences that already stopped emit padding instead of real tokens.
+        next_token = torch.where(finished, torch.full_like(next_token, pad_token_id), next_token)
+        generated.append(next_token)
+        finished = finished | is_stop(next_token)
+        if callback is not None:
+            stop_requested = bool(callback(next_token))
 
     return torch.cat([tokens, torch.stack(generated, dim=1)], dim=1)
 
@@ -163,6 +230,7 @@ def chat(
         top_k: int = 0,
         top_p: float = 1.0,
         device: torch.device | str | None = None,
+        callback: Callable[[torch.Tensor], bool | None] | None = None,
 ) -> str:
     """Single-turn chat: wrap prompt in Gemma4 chat template, generate, decode.
 
@@ -184,12 +252,15 @@ def chat(
         top_k: Top-k filtering (0 = disabled).
         top_p: Nucleus sampling threshold (1.0 = disabled).
         device: Device for input tensors (inferred from model if None).
+        callback: called with each ``[B]`` step of sampled tokens; return True
+            to stop early.  Use this to stream output.
 
     Returns:
         Decoded model response (without the chat template wrapper).
     """
     if device is None:
         device = next(model.parameters()).device
+    stop_ids = {tokenizer.EOS, tokenizer.END_OF_TURN}
 
     # Build chat-formatted token sequence
     ids: list[int] = [tokenizer.BOS, tokenizer.START_OF_TURN]
@@ -210,11 +281,13 @@ def chat(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
+        stop_tokens=stop_ids,
+        pad_token_id=tokenizer.PAD,
+        callback=callback,
     )
 
     # Decode only the newly generated tokens, strip stop tokens
     gen_ids = output[0, prompt_len:].tolist()
-    stop_ids = {tokenizer.EOS, tokenizer.END_OF_TURN}
     for i, tid in enumerate(gen_ids):
         if tid in stop_ids:
             gen_ids = gen_ids[:i]
