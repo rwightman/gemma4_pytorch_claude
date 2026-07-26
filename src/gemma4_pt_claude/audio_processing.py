@@ -24,7 +24,11 @@ if TYPE_CHECKING:
 try:
     import torchaudio  # noqa: F401
     _HAS_TORCHAUDIO = True
-except ImportError:
+except Exception:
+    # Not just ImportError: a torchaudio built against a different CUDA/torch
+    # than the installed one raises OSError from its native extension.  Nothing
+    # here needs torchaudio at import time, so treat any failure as "absent"
+    # rather than letting it break `import gemma4_pt_claude`.
     _HAS_TORCHAUDIO = False
 
 

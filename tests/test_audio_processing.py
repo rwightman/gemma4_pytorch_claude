@@ -2,7 +2,6 @@
 
 import math
 
-import numpy as np
 import pytest
 import torch
 
@@ -119,6 +118,37 @@ class TestImportGuard:
         with self._without_torchaudio() as ap:
             out = ap.preprocess_audio(torch.randn(16000))
         assert out["audio_mel"].shape[-1] == 128
+
+    def test_unusable_torchaudio_does_not_break_import(self):
+        """A torchaudio built against another CUDA/torch raises OSError, not ImportError.
+
+        If the module-level probe only caught ImportError that escaped and made
+        `import gemma4_pt_claude` fail outright.
+        """
+        import importlib
+        import sys
+
+        import gemma4_pt_claude.audio_processing as ap
+
+        class _BrokenTorchaudio:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "torchaudio":
+                    raise OSError("Could not load this library: _torchaudio.abi3.so")
+                return None
+
+        blocker = _BrokenTorchaudio()
+        saved = sys.modules.pop("torchaudio", None)
+        sys.meta_path.insert(0, blocker)
+        try:
+            reloaded = importlib.reload(ap)
+            assert reloaded._HAS_TORCHAUDIO is False
+            # And the pure-torch path still works.
+            assert reloaded.extract_mel_spectrogram(torch.randn(16000)).shape[-1] == 128
+        finally:
+            sys.meta_path.remove(blocker)
+            if saved is not None:
+                sys.modules["torchaudio"] = saved
+            importlib.reload(ap)
 
     def test_resampling_requires_torchaudio(self):
         """Only the resample path needs torchaudio, and it says so."""
@@ -269,6 +299,7 @@ class TestPreprocessAudio:
     def test_numpy_input(self):
         from gemma4_pt_claude.audio_processing import preprocess_audio
 
+        np = pytest.importorskip("numpy")
         waveform = np.random.randn(16000).astype(np.float32)
         result = preprocess_audio(waveform)
         assert result["audio_mel"].ndim == 3

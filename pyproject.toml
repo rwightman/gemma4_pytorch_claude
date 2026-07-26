@@ -21,7 +21,7 @@ audio = ["torchaudio>=2.1"]        # resampling only; mel extraction is pure tor
 image = ["pillow"]                 # PIL input to the image preprocessor
 convert = ["jax", "orbax-checkpoint", "numpy"]
 all = ["gemma4-pt-claude[audio,image]"]
-dev = ["pytest", "pytest-timeout", "pillow", "torchaudio>=2.1", "ruff"]
+dev = ["pytest", "pytest-timeout", "pillow", "numpy", "torchaudio>=2.1", "ruff"]
 
 [project.scripts]
 gemma4-convert = "gemma4_pt_claude.convert:main"

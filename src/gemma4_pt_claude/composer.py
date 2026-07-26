@@ -26,7 +26,8 @@ import torch
 
 try:
     from PIL import Image as PILImage
-except ImportError:
+except Exception:
+    # Any failure (missing, or a broken native build) means "no PIL support".
     PILImage = None  # type: ignore[assignment, misc]
 
 from .config import (
